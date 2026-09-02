@@ -1,0 +1,11 @@
+.env
+__pycache__/
+logs/benchmark_run_output.log
+logs/live.jsonl
+data/*.wav
+reports/*
+!reports/.gitkeep
+!reports/breakdown.png
+!reports/distribution.png
+!reports/summary.md
+!reports/per_turn.csv

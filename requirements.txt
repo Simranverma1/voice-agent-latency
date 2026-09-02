@@ -1,0 +1,9 @@
+# Unpinned on purpose: Python 3.13/3.14 only have wheels for recent versions.
+# Pinning exact versions forces pip to compile from source and fail.
+httpx>=0.27
+websockets>=13.0
+sounddevice>=0.5
+numpy>=2.1
+pandas>=2.2
+matplotlib>=3.8
+python-dotenv>=1.0
