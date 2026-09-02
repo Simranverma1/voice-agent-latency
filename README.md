@@ -1,305 +1,134 @@
-# Low-Latency Voice Agent — Task 1
+# Low-Latency Voice Agent
 
-A real-time spoken conversational agent, fully instrumented, with switchable
-optimization profiles so every latency improvement can be attributed to a
-specific change.
+A real-time spoken conversational agent — mic in, speech out — built to
+answer one question: **where does the latency actually go, and how much of
+it can be removed without changing what the agent says?**
+
+The pipeline is instrumented end to end on a single monotonic timeline, and
+every optimization is a configuration flag rather than a separate branch of
+code, so every latency improvement below is attributable to one specific,
+isolated change.
 
 ```
-Mic ──► VAD / endpointing ──► STT ──► LLM ──► TTS ──► Speaker
-        │                     │       │       │       │
-        └── every arrow timestamped on one monotonic timeline ──┘
+Mic / recorded prompt ──► VAD / endpointing ──► STT ──► LLM ──► TTS ──► Speaker
+                          │                     │       │       │       │
+                          └── every arrow timestamped on one monotonic timeline ──┘
 ```
 
----
+Full writeup, per-stage numbers, and answers to the standard "why did you
+optimize this and not that" questions live in **[REPORT.md](REPORT.md)**.
 
-## What you are building
+## Results
 
-**One** codebase, **five** profiles. Each turns on one more optimization:
+100 turns attempted (20 fixed prompts × 5 profiles), 88 completed
+successfully; the rest failed to genuine network conditions, not bugs (see
+REPORT.md §6-7 for why, and what that reveals about the pipeline's
+resilience).
 
-| Profile | What changes |
+| | `v1_baseline` (before) | `v5_full` (after) | Change |
+|---|---|---|---|
+| Median end-to-end | 8851 ms | 2244 ms | **−75%** |
+| p95 end-to-end | 15231 ms | 7133 ms | **−53%** |
+
+![distribution](reports/distribution.png)
+
+## The five profiles
+
+One codebase, five configurations, each turning on one more optimization
+than the last. `v1` vs. `v5` is the headline before/after; the three steps
+in between are the ablation that makes the reasoning behind it defensible.
+
+| Profile | What it adds |
 |---|---|
-| `v1_baseline` | Nothing streams. Whisper → GPT-4o → OpenAI TTS, strictly sequential. |
-| `v2_fast_llm` | Swap the LLM for Groq (still non-streaming) |
-| `v3_stream_llm_tts` | Stream LLM tokens, sentence-chunk into streaming TTS |
-| `v4_stream_stt` | Streaming STT — transcript ready the moment speech ends |
-| `v5_full` | Server-side endpointing (300 ms) instead of a 900 ms silence timer |
+| `v1_baseline` | Nothing streams. Batch STT → non-streaming LLM (larger `gpt-oss-120b`) → batch TTS, strictly sequential. |
+| `v2_fast_llm` | Swap to the smaller, faster LLM (`gpt-oss-20b`) — still fully sequential. |
+| `v3_stream_llm_tts` | Stream LLM tokens, sentence-chunk them, and stream the resulting audio into TTS as each chunk is ready. |
+| `v4_stream_stt` | Streaming STT over a websocket — the transcript is ready essentially the instant the user stops talking. |
+| `v5_full` | Server-side endpointing (~300 ms) in place of a fixed silence timer, replacing raw silence-duration with a judgment of linguistic completeness. |
 
-`v1` vs `v5` is your before/after. The steps between are your ablation, which
-is what makes the reasoning defensible in the interview.
+Both the LLM and STT/TTS run entirely on Groq and Deepgram. OpenAI (the
+originally planned baseline of Whisper + GPT-4o) was dropped: it requires a
+funded billing account with no free tier, which wasn't available here — see
+REPORT.md §7 for how that reshaped the baseline definition, without
+collapsing the five-step ablation into something less rigorous.
 
-Expect roughly a **3–5× reduction** in median perceived latency. Absolute
-numbers depend heavily on your distance from the API providers — from India
-expect ~3.5–5 s baseline and ~1.2–2 s optimized. That is fine, and the gap
-matters far more than the absolute figure.
-
----
-
-## Quick reference
+## Quickstart
 
 ```powershell
 .\.venv\Scripts\Activate.ps1        # every new terminal
-python check_setup.py               # verify keys, audio, providers
-python fix_mic.py                   # only if the mic check fails
-python make_prompts.py --mode record
-python demo.py --profile v5_full    # the live demo
-python benchmark.py --profiles all  # 100 instrumented turns
-python analyze.py                   # tables + charts
+python check_setup.py               # verify keys, audio devices, providers
+python demo.py --profile v5_full    # live mic demo of the optimized pipeline
+python benchmark.py --profiles all  # the full 100-turn instrumented run
+python analyze.py                   # tables + charts from the latest run
 ```
 
----
+Setup, from scratch, in short:
 
-## Step 1 — API keys (~15 min)
+1. **Get API keys** — Groq (console.groq.com) and Deepgram (console.deepgram.com) both free, no card required.
+2. **Create the environment**: `python -m venv .venv`, activate it, then `pip install -r requirements.txt`. Package versions in `requirements.txt` are deliberately unpinned — recent Python versions only ship prebuilt wheels for recent package versions, and pinning forces pip to compile from source.
+3. **Configure**: `copy .env.example .env`, then paste in the two keys.
+4. **Verify**: `python check_setup.py`. This plays a beep, records and plays back a mic sample, and pings both providers — every line should read `[PASS]`. If the microphone check fails, run `python fix_mic.py`, which probes every input device and rate and tells you exactly what to put in `.env`.
+5. **Build the test set**: `python make_prompts.py --mode record` records 20 fixed prompts once; every profile is then benchmarked against byte-identical audio, so the before/after comparison measures the pipeline, not variation in how a question happened to be asked that time. `python make_prompts.py --mode verify` confirms all 20 are usable.
 
-| Provider | Where | Used for | Cost |
-|---|---|---|---|
-| **Groq** | console.groq.com | Fast LLM | Free, no card |
-| **Deepgram** | console.deepgram.com | Streaming STT + Aura TTS | $200 free credit, no card |
-| **OpenAI** | platform.openai.com | Baseline Whisper + GPT-4o + TTS | Needs ~$5 on a card |
-
-For each: sign up → find "API Keys" → create → **copy immediately** (shown once).
-
-In OpenAI, do **Settings → Billing → add $5** first, or your key returns 401.
-Set a $5 usage limit while you are there. The full benchmark costs well under
-$2, nearly all of it the baseline profile.
-
----
-
-## Step 2 — Python (~10 min)
-
-```powershell
-python --version
-```
-
-Anything **3.10 or newer** is fine, including 3.14. If it errors or opens the
-Microsoft Store, install from python.org and **tick "Add python.exe to PATH"**
-on the first installer screen. Close and reopen PowerShell afterwards.
-
-Extract this project to your Desktop (right-click the zip → **Extract All**;
-do not work inside the zip preview). Then open a terminal there: in File
-Explorer, click the address bar, type `powershell`, press Enter.
-
-```powershell
-dir
-```
-
-You should see `agent`, `demo.py`, `check_setup.py`, `README.md`.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-Your prompt should now start with `(.venv)`. That prefix disappears whenever
-you close the terminal — re-run the activate line each session.
-
-> Blocked by execution policy? Run once, answer `Y`:
-> `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
-
-```powershell
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-Versions in `requirements.txt` are deliberately **unpinned**. Newer Pythons
-only have prebuilt wheels for recent package versions; pinning exact versions
-forces pip to compile numpy from source, which fails without a C toolchain.
-
----
-
-## Step 3 — Keys and mic config
-
-```powershell
-copy .env.example .env
-notepad .env
-```
-
-Paste your three keys. Leave `MIC_DEVICE` blank for now.
-
----
-
-## Step 4 — Verify everything (~3 min)
-
-```powershell
-python check_setup.py
-```
-
-It plays a beep, records you, plays it back, then pings all three providers.
-Every line should read `[PASS]`.
-
-### If the microphone check fails
-
-```powershell
-python fix_mic.py
-```
-
-This probes every input device at every sample rate, records from each, and
-ends by telling you exactly what to put in `.env`:
-
-```
-      MIC_DEVICE=8
-      MIC_NATIVE_RATE=48000
-```
-
-Put those in `.env` and re-run `check_setup.py`.
-
-**Always prefer 48000 over 44100.** 48000 divides evenly by 16000, so
-downsampling is a clean 3:1 decimation. 44100 needs fractional interpolation,
-which introduces small timing errors — bad when you are measuring milliseconds.
-
-Common mic problems:
-
-| Symptom | Fix |
-|---|---|
-| Level under ~400 | Settings → System → Sound → Input → volume to 100 |
-| `Invalid device` | `MIC_DEVICE` not set, or set to a nonexistent index |
-| No devices at all | Settings → Privacy → Microphone → enable **"Let desktop apps access your microphone"** |
-| Everything fails, and the mic also fails in Zoom/Teams | Driver problem. Device Manager → Audio inputs → right-click → Uninstall device → reboot. Or skip it: record on your phone (Step 5B). |
-
-Avoid any device named **Stereo Mix** or **loopback** — those record your
-speakers, so the agent will transcribe itself and loop forever.
-
----
-
-## Step 5 — Build the 20 test prompts
-
-**This is what separates a good submission from an average one.** If you speak
-your prompts live on every run, each run has different audio, and your
-before/after comparison partly measures *you*. Instead we fix 20 recordings and
-replay them into the pipeline byte-for-byte identically for every profile.
-
-### 5A — Record on this laptop
-
-```powershell
-python make_prompts.py --mode record
-```
-
-Press Enter → say the line → press Enter. Twenty times. Leave half a second of
-silence at each end; it gets trimmed automatically. Watch the `level=` figure —
-under 400 gets flagged, and you can delete that file and re-run to redo just it.
-
-### 5B — Record on your phone
-
-If the laptop mic is broken, this is the better path.
-
-First install ffmpeg, then **close and reopen PowerShell** and reactivate:
-
-```powershell
-winget install --id Gyan.FFmpeg -e
-```
-
-Print the sentences to read:
-
-```powershell
-python -c "from make_prompts import PROMPTS; [print(f'{i:02d}. {p}') for i,p in enumerate(PROMPTS,1)]"
-```
-
-Record 20 separate voice memos, renaming each to `01`, `02` … `20`. Copy them
-to a folder on the laptop (AirDrop, email, Drive, USB), then:
-
-```powershell
-python import_recordings.py --dir "C:\Users\you\Desktop\memos" --order name
-```
-
-Or record one long memo with ~2 s pauses between lines:
-
-```powershell
-python import_recordings.py --split "C:\Users\you\Desktop\all.m4a"
-```
-
-If the splitter finds the wrong number of segments it tells you which flag to
-adjust (`--gap`, `--thresh`).
-
-### 5C — Synthetic voices (30 seconds, no mic)
-
-```powershell
-python make_prompts.py --mode tts
-```
-
-Legitimate fallback. Say so in your report — synthetic speech is cleaner than
-real speech, so your STT numbers will be slightly optimistic.
-
-### Verify, whichever route you took
-
-```powershell
-python make_prompts.py --mode verify
-```
-
-Want `All 20 good.` Each clip 1.5–4 seconds.
-
----
-
-## Step 6 — The live demo
-
-**Wear headphones**, or the mic hears the agent and it talks to itself.
+## Running the live demo
 
 ```powershell
 python demo.py --profile v5_full
 ```
 
-Then feel the difference:
+Wear headphones — otherwise the mic picks up the agent's own reply and it
+ends up talking to itself. It listens, transcribes, replies, and prints a
+per-turn latency breakdown after each turn; `Ctrl+C` to stop. Compare it
+directly against the baseline to feel the difference:
 
 ```powershell
 python demo.py --profile v1_baseline
 ```
 
-**Screen-record both back to back.** That contrast is your demo deliverable and
-is far more convincing than a table. Ctrl+C to quit.
-
----
-
-## Step 7 — Benchmark
+## Running the benchmark
 
 ```powershell
 python benchmark.py --profiles all
 ```
 
-20 prompts × 5 profiles = 100 turns, roughly 25 minutes. Watch the
-`-> N ok, M failed` line per profile; more than 2–3 failures means something is
-wrong. Everything lands in `logs/bench.jsonl`.
-
-Cheaper first pass — just before and after, ~10 min:
+Replays all 20 recorded prompts through all 5 profiles in real time —
+roughly 30-40 minutes depending on network conditions, since a portion of
+that time is genuinely just the recordings and the agent's spoken replies
+playing out. Every turn is appended to `logs/bench.jsonl` regardless of
+whether it succeeded, so a run can be resumed or re-analyzed without
+re-running it. For a faster before/after pass:
 
 ```powershell
 python benchmark.py --profiles v1_baseline v5_full
 ```
 
----
-
-## Step 8 — Results
+Then:
 
 ```powershell
 python analyze.py
 ```
 
-Writes to `reports/`:
-
-- **summary.md** — median/p95 tables, per-stage breakdown, before/after. Paste
-  straight into your writeup.
-- **per_turn.csv** — raw data
-- **breakdown.png** — stacked critical-path bars
-- **distribution.png** — box plots
-
-Then fill in `REPORT.md`, which already has the interview answers structured.
-
----
+writes `reports/summary.md` (the tables), `reports/per_turn.csv` (raw data
+behind every number in the report), and `reports/breakdown.png` /
+`reports/distribution.png` (the charts embedded in REPORT.md).
 
 ## How the measurement works
 
 Every turn records **one monotonic timeline** (`time.perf_counter`, never
-`time.time`). All metrics are derived by subtraction, so they are internally
-consistent by construction.
+`time.time`) in `agent/metrics.py`. All metrics are derived by subtraction
+from that single timeline, so they stay internally consistent by
+construction, and the full event history for a turn can be re-examined
+after the fact from `logs/bench.jsonl` without re-running anything.
 
 | Mark | Meaning |
 |---|---|
-| `speech_end_true` | Ground truth: last audio block containing real signal |
-| `eot_detected` | When our system *decided* the turn ended |
+| `speech_end_true` | Ground truth: the last audio block containing real signal |
+| `eot_detected` | The moment the system *decided* the turn had ended |
 | `stt_final` | Final transcript in hand |
-| `llm_request_sent` | HTTP request dispatched |
+| `llm_request_sent` | LLM request dispatched |
 | `llm_first_token` / `llm_last_token` | First / last token off the wire |
-| `tts_request_sent` / `tts_first_audio` | TTS dispatched / first audio byte |
-| `playback_start` | **First sample written to the sound card** |
-
-The six required metrics:
+| `tts_request_sent` / `tts_first_audio` | TTS dispatched / first audio byte received |
+| `playback_start` | First sample actually written to the sound card |
 
 ```
 end-of-speech detection = eot_detected      - speech_end_true
@@ -307,85 +136,77 @@ speech-to-text          = stt_final         - eot_detected
 LLM time-to-first-token = llm_first_token   - llm_request_sent
 LLM total response      = llm_last_token    - llm_request_sent
 TTS time-to-first-audio = tts_first_audio   - tts_request_sent
-END-TO-END (perceived)  = playback_start    - speech_end_true
+end-to-end (perceived)  = playback_start    - speech_end_true
 ```
 
-### The subtlety that will come up in the interview
-
-In a **streaming** pipeline the stages overlap: the LLM is still generating
-while TTS is synthesising while the speaker is already playing. So the
-per-stage numbers **do not sum to end-to-end** — adding them double-counts.
-
-`metrics.py` therefore also computes a **critical path**: seven contiguous,
-non-overlapping segments from `speech_end_true` to `playback_start` that *do*
-sum exactly to e2e. Use the critical path for "where is the time going", and
-per-stage numbers for "how fast is each component". Being able to explain that
-distinction is worth a lot.
-
----
+**One subtlety worth knowing going in:** in the streaming profiles, LLM
+generation, TTS synthesis, and playback overlap in time, so the per-stage
+numbers above do **not** sum to end-to-end — adding them double-counts the
+overlapping work. `Turn.critical_path()` in `agent/metrics.py` instead
+computes seven contiguous, non-overlapping segments that *do* sum exactly to
+end-to-end. Per-stage numbers answer "how fast is each component";
+critical path answers "where does the time actually go." REPORT.md uses
+both, deliberately, for different questions.
 
 ## Project layout
 
 ```
 voice-agent/
 ├── agent/
-│   ├── config.py       profiles — every optimization is a flag here
-│   ├── metrics.py      Turn timeline, metric derivation, JSONL logging
-│   ├── audio_io.py     MicSource, WavSource, VAD, downsampler, Player
-│   ├── stt.py          Whisper batch, Deepgram batch, Deepgram websocket
-│   ├── llm.py          OpenAI + Groq, streaming and non-streaming
-│   ├── tts.py          OpenAI + Deepgram Aura, plus the sentence chunker
-│   └── pipeline.py     orchestrator — runs every profile
-├── check_setup.py      verify keys, audio, providers
-├── fix_mic.py          microphone diagnostic
-├── make_prompts.py     build the 20 fixed test utterances
-├── import_recordings.py  import phone recordings
-├── demo.py             live microphone demo
-├── benchmark.py        replay harness
-├── analyze.py          stats + charts
-└── REPORT.md           your writeup
+│   ├── config.py        the five profiles - every optimization is a flag here
+│   ├── metrics.py        Turn timeline, metric derivation, JSONL logging
+│   ├── audio_io.py       MicSource, WavSource, VAD, downsampler, Player
+│   ├── stt.py             Deepgram batch + streaming websocket
+│   ├── llm.py             Groq, streaming and non-streaming
+│   ├── tts.py             Deepgram Aura + the sentence chunker
+│   ├── net.py             shared retry helper for transient network errors
+│   └── pipeline.py       orchestrator - runs every profile through the same code path
+├── check_setup.py        verify keys, audio devices, providers
+├── fix_mic.py             microphone diagnostic
+├── make_prompts.py       build/verify the 20 fixed test prompts
+├── import_recordings.py  import prompts recorded on a phone
+├── demo.py                live microphone demo
+├── benchmark.py           the replay harness that produces logs/bench.jsonl
+├── analyze.py             stats + charts from logs/bench.jsonl
+└── REPORT.md              full writeup: measurements, reasoning, interview answers
 ```
 
----
+## Environment notes
 
-## Notes on environment quirks handled here
+A few non-obvious things this codebase handles, worth knowing if you're
+reading the source:
 
-Worth mentioning in your report — they show you understood your own stack.
-
-**No `audioop`.** Python 3.13 removed it (PEP 594). All PCM maths is numpy.
-
-**Sample rate conversion.** Many Windows mics (Realtek via WDM-KS) refuse
-16 kHz, which is what the STT providers need. `audio_io.py` captures at the
-device's native rate and decimates to 16 kHz with a windowed-sinc
-anti-aliasing filter whose state carries across block boundaries. Skipping the
-filter would fold everything above 8 kHz back into the speech band as aliasing
-and quietly degrade transcripts.
-
-**Channel count.** WDM-KS devices refuse to open at any channel count other
-than their native one, so we open at the hardware count and downmix to mono
-ourselves.
-
-**Model availability drifts.** Groq deprecated its Llama chat models; the
-profiles use `openai/gpt-oss-20b`. If that 404s, list what your key can reach:
-
-```powershell
-python -c "import httpx,os;from dotenv import load_dotenv;load_dotenv();r=httpx.get('https://api.groq.com/openai/v1/models',headers={'Authorization':'Bearer '+os.getenv('GROQ_API_KEY')});[print(m['id']) for m in sorted(r.json()['data'],key=lambda x:x['id'])]"
-```
-
-then update `llm_model` in `agent/config.py`.
-
----
+- **No `audioop`.** Python 3.13 removed it (PEP 594); all PCM math here is
+  numpy instead.
+- **Sample rate conversion.** Many Windows mics only expose a native rate
+  other than 16 kHz (what the STT providers require). `audio_io.py` captures
+  at the device's native rate and decimates down with a windowed-sinc
+  anti-aliasing filter whose state carries across block boundaries —
+  skipping that filter would fold energy above 8 kHz back into the speech
+  band as aliasing and quietly degrade transcripts.
+- **Channel count.** Some Windows audio backends refuse to open a device at
+  any channel count other than its native one, so capture happens at the
+  hardware channel count and gets downmixed to mono afterward.
+- **VAD calibration vs. trimmed recordings.** The local energy-based VAD
+  calibrates its noise floor from the first ~500 ms of audio, which is a
+  reasonable assumption for a live mic (silent before the user starts
+  speaking) but breaks for a recording with its leading silence already
+  trimmed off. `WavSource` compensates by prepending a short genuine-silence
+  lead-in before replaying each recording.
+- **Model availability drifts.** Groq occasionally deprecates model IDs; if
+  a configured model 404s, list what the current key can reach and update
+  `llm_model` in `agent/config.py`:
+  ```powershell
+  python -c "import httpx,os;from dotenv import load_dotenv;load_dotenv();r=httpx.get('https://api.groq.com/openai/v1/models',headers={'Authorization':'Bearer '+os.getenv('GROQ_API_KEY')});[print(m['id']) for m in sorted(r.json()['data'],key=lambda x:x['id'])]"
+  ```
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `ModuleNotFoundError` | venv not active — `.\.venv\Scripts\Activate.ps1` |
-| pip fails building numpy | Unpin versions (already done here) and upgrade pip |
-| `Invalid number of channels` | Old `audio_io.py` — this version handles it |
-| `no module named audioop` | Old file version; this one uses numpy |
-| Groq 404 | Model deprecated — list models, update `config.py` |
-| OpenAI 401 | No billing set up |
-| Agent replies to itself | Use headphones, and never pick a Stereo Mix device |
-| Turn 1 slower than the rest | TLS handshake. `_warm()` reduces it; note it or discard turn 1 |
-| Deepgram websocket closes | Free-tier concurrency — lower `--repeat` |
+| `ModuleNotFoundError` | The venv isn't active — `.\.venv\Scripts\Activate.ps1` |
+| pip fails building numpy | Make sure `requirements.txt` stays unpinned and pip is up to date |
+| Groq 404 | Model deprecated - list available models (above) and update `config.py` |
+| Agent replies to itself | Wear headphones, and never select a "Stereo Mix" / loopback input device |
+| Turn 1 noticeably slower than the rest | TLS handshake cost; `VoiceAgent._warm()` pre-opens the connection to avoid charging this to turn 1, but note or discard it if it still stands out |
+| A `benchmark.py` turn fails | Diagnose from `logs/bench.jsonl` rather than re-running - the full event timeline for every turn is preserved, so metrics can be re-derived without re-running anything |

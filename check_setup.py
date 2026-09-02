@@ -35,10 +35,9 @@ def check_packages():
 
 
 def check_keys():
-    from agent.config import DEEPGRAM_API_KEY, GROQ_API_KEY, OPENAI_API_KEY
+    from agent.config import DEEPGRAM_API_KEY, GROQ_API_KEY
     ok_all = True
-    for name, val in [("OPENAI_API_KEY", OPENAI_API_KEY), ("GROQ_API_KEY", GROQ_API_KEY),
-                      ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY)]:
+    for name, val in [("GROQ_API_KEY", GROQ_API_KEY), ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY)]:
         ok = bool(val) and len(val) > 15 and not val.endswith("...")
         ok_all &= report(ok, f"{name} present",
                          "" if ok else "add it to .env (copy .env.example to .env)")
@@ -92,20 +91,11 @@ def check_audio():
 
 async def check_apis():
     import httpx
-    from agent.config import DEEPGRAM_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, PROFILES
+    from agent.config import DEEPGRAM_API_KEY, GROQ_API_KEY, PROFILES
 
     groq_model = PROFILES["v5_full"].llm_model
 
     async with httpx.AsyncClient(timeout=30.0) as c:
-        try:
-            t0 = time.perf_counter()
-            r = await c.get("https://api.openai.com/v1/models",
-                            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
-            report(r.status_code == 200, f"OpenAI API ({(time.perf_counter()-t0)*1000:.0f} ms)",
-                   "" if r.status_code == 200 else f"HTTP {r.status_code} - bad key or no billing")
-        except Exception as e:
-            report(False, "OpenAI API", str(e))
-
         try:
             t0 = time.perf_counter()
             r = await c.post("https://api.groq.com/openai/v1/chat/completions",
