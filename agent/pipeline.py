@@ -207,15 +207,45 @@ class VoiceAgent:
             finally:
                 await text_q.put(None)
 
+        async def fetch_chunk_audio(chunk: str) -> bytes:
+            turn.mark("tts_request_sent")
+            audio = bytearray()
+            async for b in synth(chunk, self.client, self.p.tts_model):
+                turn.mark("tts_first_audio")
+                audio.extend(b)
+            return bytes(audio)
+
         async def consumer():
-            while True:
-                chunk = await text_q.get()
-                if chunk is None:
-                    break
-                turn.mark("tts_request_sent")
-                async for b in synth(chunk, self.client, self.p.tts_model):
-                    turn.mark("tts_first_audio")
-                    player.feed(b)
+            """Dispatch each chunk's TTS request the instant its text is ready,
+            without waiting for the previous chunk's audio to finish downloading.
+
+            Sequential dispatch (start chunk N+1's request only after chunk N's
+            full response has arrived) leaves the speaker silent whenever a
+            chunk finishes playing before the next chunk's request has even
+            gotten its first byte back - audible on any connection with real
+            RTT. Pipelining the requests removes that gap; playback order is
+            still preserved because results are fed to the player strictly in
+            the order the chunks were produced, regardless of which network
+            response happens to land first.
+            """
+            fetch_q: asyncio.Queue = asyncio.Queue()
+
+            async def dispatcher():
+                while True:
+                    chunk = await text_q.get()
+                    if chunk is None:
+                        await fetch_q.put(None)
+                        break
+                    await fetch_q.put(asyncio.create_task(fetch_chunk_audio(chunk)))
+
+            async def feeder():
+                while True:
+                    task = await fetch_q.get()
+                    if task is None:
+                        break
+                    player.feed(await task)
+
+            await asyncio.gather(dispatcher(), feeder())
 
         turn.mark("llm_request_sent")
         await asyncio.gather(producer(), consumer())
