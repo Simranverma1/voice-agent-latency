@@ -17,7 +17,6 @@
 | Median e2e | 9563 ms | 3439 ms | **−6124 ms (64% faster)** |
 | p95 e2e | 14615 ms | 4503 ms | **−10113 ms (69% faster)** |
 
-![distribution](reports/distribution.png)
 
 ## 3. Full per-stage measurements
 
