@@ -4,9 +4,9 @@
 
 - **Machine / OS:** Windows 10, Python 3.14, laptop mic (Realtek/WDM-KS input, downsampled 48 kHz → 16 kHz with a windowed-sinc anti-aliasing filter).
 - **Network:** User is located in India; both providers (Groq, Deepgram) are US-hosted. Initial connectivity checks measured ~450 ms for a minimal Groq completion, ~1360 ms for a Deepgram streaming-websocket handshake, and ~3160 ms for a full Deepgram TTS round trip — all before any pipeline work begins. This RTT is baked into every number below; it is not a code artifact.
-- **Providers:** Groq (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`) for the LLM, Deepgram (STT `nova-3`, TTS `aura-2-thalia-en`) for speech. OpenAI was originally planned as the "before" baseline (Whisper + GPT-4o + tts-1) but was dropped entirely: the account had no billing credits and no free tier was available, so every profile — including the baseline — had to run on Groq + Deepgram, both usable on free-tier keys. See §7 for how this reshaped the baseline definition.
+- **Providers:** Groq (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`) for the LLM, Deepgram (STT `nova-3`, TTS `aura-2-thalia-en`) for speech. OpenAI was originally planned as the "before" baseline (Whisper + GPT-4o + tts-1) but was dropped entirely: the account had no billing credits and no free tier was available, so every profile — including the baseline — had to run on Groq + Deepgram, both usable on free-tier keys. The baseline's "slow LLM" is therefore the larger `gpt-oss-120b` on Groq rather than a different vendor (see §5 and §6).
 - **Test set:** 20 fixed utterances, recorded with a real human voice (not synthetic), replayed identically into every profile via `WavSource` so all five profiles see byte-identical audio.
-- **Turns measured:** 90 successful turns out of 100 attempted (20 prompts × 5 profiles). The 10 failures were transient network errors (timeouts, empty transcripts from a dropped streaming connection) under real conditions — see §6-7.
+- **Turns measured:** 90 successful turns out of 100 attempted (20 prompts × 5 profiles). The 10 failures were transient network errors (timeouts, empty transcripts from a dropped streaming connection) under real conditions — see §6.
 - **Clock:** `time.perf_counter()`, one monotonic event timeline per turn; every metric is derived by subtraction from that single timeline.
 - **Zero point:** the last audio block containing real signal in the source recording (`speech_end_true`), not when the recording file ends.
 
@@ -47,9 +47,9 @@ STT drops from a ~2000 ms median for batch requests (v1-v3) to 0 ms for streamin
 
 ![breakdown](reports/breakdown.png)
 
-**Note on reading this chart:** in the streaming profiles, LLM generation, TTS synthesis, and playback overlap. The bars show the *critical path* — seven contiguous, non-overlapping segments that sum exactly to that profile's median e2e — not the raw per-stage timings above, which would double-count overlapping work.
+**Note on reading this chart:** in the streaming profiles, LLM generation, TTS synthesis, and playback overlap. The bars show the *critical path* — seven contiguous, non-overlapping segments — not the raw per-stage timings above, which would double-count overlapping work. Within any single turn the seven segments sum exactly to that turn's e2e (checked across all 90 turns in `logs/bench.jsonl`: the largest discrepancy is 0.2 ms, which is rounding). Each bar segment, however, is that segment's **median across turns**, and medians don't add: the sum of the segment medians is close to the profile's median e2e but not equal to it (v1: 7764 vs 9563 ms; v5: 3510 vs 3439 ms). Read the bars as "the typical share of each segment", not as a decomposition of the headline median.
 
-Baseline (`v1_baseline`) critical path (median):
+Baseline (`v1_baseline`) critical path (median of each segment):
 
 | Segment | ms | % of total |
 |---|---|---|
@@ -60,7 +60,9 @@ Baseline (`v1_baseline`) critical path (median):
 | text buffering | 0 | 0.0% |
 | TTS TTFA | 359 | 4.6% |
 | **audio to speaker** | **3448** | **44.4%** |
-| total | 7764 | 100% |
+| sum of segment medians | 7764 | 100% |
+
+The percentages are shares of that 7764 ms sum, not of the 9563 ms median e2e. The gap exists because slow turns are slow in *different* segments: of the 10 slowest v1 turns, 6 are dominated by a slow batch STT request (5.5–9.4 s, vs a 2.0 s median) and 4 by a long audio-to-speaker wait (6.0–14.0 s, vs a 3.4 s median). Each segment's median ignores the other group's outliers, so the summed medians understate the median total.
 
 `audio to speaker` — the time between the first TTS byte arriving and playback actually starting — dominates the baseline. That is not audio-hardware latency; it is the direct consequence of Path A's design: "nothing plays until the whole file exists" (per `pipeline.py`'s baseline branch). The LLM finishes generating and TTS starts synthesizing quickly (TTFT 561 ms, TTS TTFA 359 ms), but the reply then has to be *fully* downloaded and assembled before a single sample reaches the speaker.
 

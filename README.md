@@ -20,15 +20,15 @@ optimize this and not that" questions live in **[REPORT.md](REPORT.md)**.
 
 ## Results
 
-100 turns attempted (20 fixed prompts × 5 profiles), 88 completed
+100 turns attempted (20 fixed prompts × 5 profiles), 90 completed
 successfully; the rest failed to genuine network conditions, not bugs (see
-REPORT.md §6-7 for why, and what that reveals about the pipeline's
+REPORT.md §6 for why, and what that reveals about the pipeline's
 resilience).
 
-| | `v1_baseline` (before) | `v5_full` (after) | Change |
+| | `v1_baseline` (before, n=20) | `v5_full` (after, n=17) | Change |
 |---|---|---|---|
-| Median end-to-end | 8851 ms | 2244 ms | **−75%** |
-| p95 end-to-end | 15231 ms | 7133 ms | **−53%** |
+| Median end-to-end | 9563 ms | 3439 ms | **−64%** |
+| p95 end-to-end | 14615 ms | 4503 ms | **−69%** |
 
 ![distribution](reports/distribution.png)
 
@@ -49,7 +49,7 @@ in between are the ablation that makes the reasoning behind it defensible.
 Both the LLM and STT/TTS run entirely on Groq and Deepgram. OpenAI (the
 originally planned baseline of Whisper + GPT-4o) was dropped: it requires a
 funded billing account with no free tier, which wasn't available here — see
-REPORT.md §7 for how that reshaped the baseline definition, without
+REPORT.md §1 and §6 for how that reshaped the baseline definition, without
 collapsing the five-step ablation into something less rigorous.
 
 ## Quickstart
@@ -144,7 +144,9 @@ generation, TTS synthesis, and playback overlap in time, so the per-stage
 numbers above do **not** sum to end-to-end — adding them double-counts the
 overlapping work. `Turn.critical_path()` in `agent/metrics.py` instead
 computes seven contiguous, non-overlapping segments that *do* sum exactly to
-end-to-end. Per-stage numbers answer "how fast is each component";
+that turn's end-to-end. (Per turn only: the median of each segment, summed,
+is not the median end-to-end, because medians don't add.) Per-stage numbers
+answer "how fast is each component";
 critical path answers "where does the time actually go." REPORT.md uses
 both, deliberately, for different questions.
 
