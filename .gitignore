@@ -9,3 +9,6 @@ reports/*
 !reports/distribution.png
 !reports/summary.md
 !reports/per_turn.csv
+CLAUDE.md
+.claude/
+desktop.ini
