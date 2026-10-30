@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Agent Demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/">Low-latency voice agent</a>
+    <nav><a href="/">How it works</a><a href="/demo">Live demo</a></nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="demo-grid">
+    <section>
+      <div class="card">
+        <h1 style="margin-top:0;font-size:1.5rem">Talk to the agent</h1>
+        <p class="muted small" style="margin-top:0">
+          Press start, allow the microphone, and ask a question. Pause when you're done
+          and the agent replies out loud. Headphones work best.
+        </p>
+        <div class="controls">
+          <input id="code" type="password" autocomplete="off" placeholder="Access code" aria-label="Access code">
+          <button id="talk" class="btn">Start talking</button>
+        </div>
+        <div class="status"><span id="dot" class="dot"></span><span id="status">Not connected</span></div>
+        <div class="meter" aria-hidden="true"><div id="level"></div></div>
+        <div id="notice" class="notice" role="status"></div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top:0;font-size:1.1rem">Conversation</h2>
+        <div id="log" class="log"><p class="muted small" id="log-empty">Nothing yet.</p></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <h2 style="margin-top:0;font-size:1.1rem">This turn <span class="badge live">LIVE</span></h2>
+        <div class="kpis">
+          <div class="kpi">
+            <div class="muted small">You stop talking → you hear the reply</div>
+            <div class="big" id="k-browser">—</div>
+            <div class="muted small">measured in your browser</div>
+          </div>
+          <div class="kpi">
+            <div class="muted small">Server: speech end → first audio sent</div>
+            <div class="big" id="k-server">—</div>
+            <div class="muted small">measured on the server</div>
+          </div>
+        </div>
+        <p class="muted small" id="k-diff" style="margin-bottom:0"></p>
+        <div class="bar" id="bar" aria-label="Where the server's time went"></div>
+        <div class="legend" id="legend"></div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top:0;font-size:1.1rem">All turns <span class="badge live">LIVE</span></h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>#</th><th>You said</th><th class="num">Browser</th><th class="num">Server</th><th class="num">Network + playback</th></tr></thead>
+            <tbody id="history"></tbody>
+          </table>
+        </div>
+        <p class="muted small" style="margin-bottom:0">
+          For comparison <span class="badge bench">BENCHMARK</span>: the optimized pipeline's median was
+          <strong>3439 ms</strong> over 17 recorded prompts replayed on a laptop in India calling US-hosted APIs.
+          Benchmark and live numbers are measured differently; see <a href="/#measurement">how</a>.
+        </p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="/static/demo.js"></script>
+</body>
+</html>

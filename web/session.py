@@ -41,8 +41,10 @@ MEASUREMENT = (
 # can start playing early, large enough to keep per-message overhead low.
 AUDIO_FRAME_BYTES = 4800
 
-# Deepgram closes a streaming socket after ~10 s without audio. While the
-# agent is talking we stop forwarding mic audio, so ping it instead.
+# Deepgram closes a streaming socket after ~10 s without audio. Audio stops
+# both while the server is replying and while the browser is still playing
+# the reply (it mutes the mic so the agent doesn't hear itself), so ping
+# whenever nothing has been forwarded for this long.
 KEEPALIVE_S = 3.0
 
 SAFETY_NET_BLOCKS = 2500 // MIC_BLOCK_MS
@@ -112,6 +114,7 @@ class Session:
         self.audio_in: asyncio.Queue = asyncio.Queue()
         self._partial = b""
         self.listening = False
+        self._last_dg_audio = now()
         self._keepalive_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ transport
@@ -166,9 +169,10 @@ class Session:
 
     async def _keepalive(self):
         while True:
-            await asyncio.sleep(KEEPALIVE_S)
-            if not self.listening and self.dg is not None:
+            await asyncio.sleep(1.0)
+            if self.dg is not None and now() - self._last_dg_audio > KEEPALIVE_S:
                 await self.dg.keepalive()
+                self._last_dg_audio = now()
 
     async def _ensure_dg(self):
         # Mirrors pipeline.py:54-68: connect before the user speaks, and only
@@ -207,6 +211,7 @@ class Session:
                 ts, block = item
                 pcm.extend(block)
                 await self.dg.send(block)
+                self._last_dg_audio = ts
 
                 if self.vad.is_speech(block):
                     speech_started = True
