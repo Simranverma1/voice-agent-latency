@@ -1,0 +1,27 @@
+# Render Blueprint for the web demo. Render reads this file when you create
+# a "Blueprint" from the repo; see web/ and README.md ("Web demo").
+services:
+  - type: web
+    name: voice-agent-demo
+    runtime: python
+    # US region: the server talks to Groq and Deepgram (both US-hosted)
+    # several times per turn, but to the browser only once each way, so it
+    # should sit next to the providers rather than next to the user.
+    region: virginia
+    plan: free
+    branch: web-demo
+    buildCommand: pip install -r web/requirements.txt
+    startCommand: uvicorn web.server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.7          # same as the local .venv the code was tested on
+      # Secrets: "sync: false" makes Render ask for the value in the
+      # dashboard instead of storing it in git.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: ACCESS_CODE
+        sync: false
+      # TEST_MODE is deliberately absent: it must never be on in deployment.

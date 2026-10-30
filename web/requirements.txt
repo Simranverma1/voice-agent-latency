@@ -1,0 +1,14 @@
+# Server-only dependencies for the deployed web demo (render.yaml installs
+# this file, not the root requirements.txt). Deliberately excludes
+# sounddevice, pandas and matplotlib: the server never plays audio or draws
+# charts, and leaving sounddevice out guarantees it can't be imported there.
+#
+# Pinned to the exact versions tested locally on Python 3.14.7. The root
+# requirements.txt stays unpinned because pinning *old* versions forces
+# source builds on 3.14; these are current versions with prebuilt wheels.
+fastapi==0.162.0
+uvicorn==0.54.0
+httpx==0.28.1
+websockets==17.1
+numpy==2.5.2
+python-dotenv==1.2.3
