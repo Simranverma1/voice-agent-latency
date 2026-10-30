@@ -85,6 +85,69 @@ directly against the baseline to feel the difference:
 python demo.py --profile v1_baseline
 ```
 
+## Web demo
+
+**Live:** _link coming soon_ (access code required; ask the author).
+
+A browser version of the optimized `v5_full` pipeline: press a button, talk,
+and hear the reply, with a live latency breakdown for every turn. The landing
+page (`/`) explains the project for a non-technical audience; the demo is at
+`/demo`.
+
+### Run it locally
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+# .env needs GROQ_API_KEY, DEEPGRAM_API_KEY and ACCESS_CODE (see .env.example)
+uvicorn web.server:app --port 8000
+```
+
+Open http://127.0.0.1:8000/demo in Chrome, enter the access code, press
+**Start talking**, and allow the microphone. Headphones work best.
+
+### How it works
+
+```
+Browser                                   Server (FastAPI, web/)                     Providers
+mic → AudioWorklet                        one Session per connection
+      (48 kHz → 16 kHz, anti-aliased)  ─► Deepgram streaming STT + endpointing ───►  Deepgram
+      20 ms int16 blocks over WebSocket    Groq LLM, streamed token by token  ────►  Groq
+speaker ◄ gapless Web Audio playback  ◄─  sentence chunks → Deepgram Aura TTS ───►  Deepgram
+                                           (requests pipelined, played in order)
+```
+
+- **Same pipeline as the benchmark.** `web/session.py` reuses `agent/stt.py`,
+  `agent/llm.py`, `agent/tts.py`, `agent/metrics.py` and the `v5_full`
+  profile unchanged. Only the turn orchestration is re-implemented, because
+  `agent/pipeline.py` drives a local sound card and imports `sounddevice`,
+  which doesn't exist on a headless Linux server. Each orchestration step
+  points to the `pipeline.py` lines it mirrors.
+- **Two live latency numbers per turn.** The server measures
+  speech end → first reply audio *sent*; the browser measures speech end →
+  reply audio *playing*. The difference is the internet hop plus browser
+  buffering. Live records in `logs/live_web.jsonl` carry a `measurement`
+  field so they can't be confused with benchmark numbers.
+- **Half-duplex.** The page stops sending microphone audio while the reply
+  plays, so the agent can't hear and answer itself. There is no barge-in.
+- **Limits** (environment variables, defaults in brackets): `ACCESS_CODE`
+  (required; the server refuses everyone without it), `MAX_SESSIONS` [2],
+  `MAX_TURNS` per session [20], `MAX_UTTERANCE_S` [15], `MAX_IDLE_S` [120].
+
+### Tests
+
+```powershell
+node web/test_resampler.js              # browser downsampler: passband, anti-aliasing, block seams
+python -m web.test_limits               # access code, session cap, idle, bad keys (no API cost)
+python -m web.test_limits --live        # + utterance cap and turn limit (2 live turns)
+python -m web.test_client 1 2           # stream recordings through the server (2 live turns)
+```
+
+For a full browser test without speaking, run the server with `TEST_MODE=1`.
+The demo page then shows a **Play recording** panel that feeds a prompt from
+`data/` through the same AudioWorklet path the microphone uses. Never set
+`TEST_MODE` in deployment.
+
 ## Running the benchmark
 
 ```powershell
@@ -170,6 +233,13 @@ voice-agent/
 ├── demo.py                live microphone demo
 ├── benchmark.py           the replay harness that produces logs/bench.jsonl
 ├── analyze.py             stats + charts from logs/bench.jsonl
+├── web/
+│   ├── server.py          FastAPI app: pages, /health, /ws, access code, session cap
+│   ├── session.py         one browser conversation running the v5_full pipeline
+│   ├── vad.py             energy VAD (copy of audio_io's, without sounddevice)
+│   ├── static/            landing page, demo page, AudioWorklet downsampler
+│   └── test_*.py/.js      headless client, limit tests, resampler unit test
+├── render.yaml            deployment config for Render
 └── REPORT.md              full writeup: measurements, reasoning, interview answers
 ```
 
@@ -202,6 +272,19 @@ reading the source:
   python -c "import httpx,os;from dotenv import load_dotenv;load_dotenv();r=httpx.get('https://api.groq.com/openai/v1/models',headers={'Authorization':'Bearer '+os.getenv('GROQ_API_KEY')});[print(m['id']) for m in sorted(r.json()['data'],key=lambda x:x['id'])]"
   ```
 
+## Tools used
+
+- **Providers:** Groq (LLM) and Deepgram (speech-to-text and text-to-speech),
+  called with raw `httpx` / `websockets` so every byte's arrival can be
+  timestamped.
+- **Server:** FastAPI + uvicorn. **Browser:** plain HTML/CSS/JavaScript, Web
+  Audio API and AudioWorklet; no frameworks.
+- **Hosting:** Render.
+- **Claude Code** (Anthropic) was used as a coding assistant throughout:
+  writing and reviewing code, running tests, and diagnosing failures. Design
+  decisions, measurements and conclusions were reviewed by the author, who
+  can explain every part of the system.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -212,3 +295,5 @@ reading the source:
 | Agent replies to itself | Wear headphones, and never select a "Stereo Mix" / loopback input device |
 | Turn 1 noticeably slower than the rest | TLS handshake cost; `VoiceAgent._warm()` pre-opens the connection to avoid charging this to turn 1, but note or discard it if it still stands out |
 | A `benchmark.py` turn fails | Diagnose from `logs/bench.jsonl` rather than re-running - the full event timeline for every turn is preserved, so metrics can be re-derived without re-running anything |
+| Web demo: "rejected the server's API key" | A provider key in `.env` (or on Render) is wrong or expired; Deepgram keys can have an expiry date |
+| Web demo: "Waking up the server…" for a minute | Normal on Render's free tier after 15 minutes idle; the server is booting |
