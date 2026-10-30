@@ -279,19 +279,29 @@ function connect() {
   ws.onclose = () => {
     ws = null; serverListening = false;
     if (userStopped) { setState("stopped"); return; }
-    if (terminalError) { userStopped = true; stopAudio(); setState("error", "Stopped"); return; }
-    if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
-      userStopped = true; stopAudio(); setState("error", "Couldn't reconnect");
-      notice("Lost the connection to the server and couldn't get it back. Press Start talking to try again.", "error");
+    if (terminalError) {
+      // E.g. the turn limit arrives right after the last reply's audio:
+      // let it finish playing before releasing the speakers and mic.
+      userStopped = true;
+      const remainingMs = ctx ? Math.max(0, (playEnd - ctx.currentTime) * 1000) : 0;
+      setTimeout(stopAudio, remainingMs + 200);
+      setState("error", "Stopped");
       return;
     }
+    if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) { giveUp(); return; }
     const delay = RECONNECT_DELAYS_MS[reconnectAttempt++];
     setState("reconnecting", `Connection lost — reconnecting in ${Math.round(delay / 1000)} s (attempt ${reconnectAttempt})…`);
     reconnectTimer = setTimeout(async () => {
       if (userStopped) return;
       if (await wakeServer()) connect();
+      else if (!userStopped) giveUp();   // never leave the page stuck on "waking up"
     }, delay);
   };
+}
+
+function giveUp() {
+  userStopped = true; stopAudio(); setState("error", "Couldn't reconnect");
+  notice("Lost the connection to the server and couldn't get it back. Press Start talking to try again.", "error");
 }
 
 async function start() {

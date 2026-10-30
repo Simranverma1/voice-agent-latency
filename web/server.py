@@ -14,8 +14,9 @@ Each websocket connection gets its own Session (its own Deepgram socket, HTTP
 pool and conversation history), so two browsers never share state.
 
 Protocol
-  client -> server  binary: 16 kHz mono int16 PCM, any frame size
-                    text:   {"type": "hello", "code": ...} first
+  client -> server  text:   {"type": "hello", "code": ...} first, within 10 s;
+                            refused unless code == $ACCESS_CODE
+                    binary: 16 kHz mono int16 PCM, any frame size
   server -> client  binary: 24 kHz mono int16 PCM (TTS audio)
                     text:   JSON events
                       {"type": "ready", "profile": ...}
@@ -30,6 +31,8 @@ Protocol
 """
 import asyncio
 import contextlib
+import hmac
+import json
 import os
 from pathlib import Path
 
@@ -42,6 +45,19 @@ from .session import Session
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
 CHARTS = {"breakdown.png", "distribution.png"}
+
+# Every session costs real API credit and holds a Deepgram socket open, so
+# only a couple may run at once. Read per request so tests can override it.
+HELLO_TIMEOUT_S = 10
+BAD_CODE_DELAY_S = 1.0   # slows down guessing the access code
+_active_sessions = 0
+
+
+def _max_sessions() -> int:
+    try:
+        return int(os.getenv("MAX_SESSIONS", "2"))
+    except ValueError:
+        return 2
 
 app = FastAPI(title="voice-agent web demo", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -72,26 +88,79 @@ async def chart(name: str):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True}
+    return {"ok": True, "sessions": _active_sessions, "max_sessions": _max_sessions()}
+
+
+async def _reject(ws: WebSocket, code: str, message: str, close_code: int):
+    # Browsers can't read the HTTP status of a refused websocket handshake,
+    # so accept, explain in a JSON event, then close.
+    with contextlib.suppress(Exception):
+        await ws.send_text(json.dumps({"type": "error", "code": code, "message": message}))
+        await ws.close(code=close_code)
+
+
+async def _read_hello(ws: WebSocket) -> dict | None:
+    try:
+        msg = await asyncio.wait_for(ws.receive(), timeout=HELLO_TIMEOUT_S)
+        if msg.get("text"):
+            hello = json.loads(msg["text"])
+            if isinstance(hello, dict) and hello.get("type") == "hello":
+                return hello
+    except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect, RuntimeError):
+        pass
+    return None
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    global _active_sessions
     await ws.accept()
+
+    hello = await _read_hello(ws)
+    expected = os.getenv("ACCESS_CODE", "")
+    if not expected:
+        # Fail closed: a deployment that forgot the variable must not be
+        # open to everyone on the internet, spending the API credit.
+        await _reject(ws, "server_misconfigured",
+                      "The demo isn't configured yet (no access code is set on the server).", 4500)
+        return
+    if hello is None:
+        await _reject(ws, "bad_hello", "The page and server couldn't agree how to talk. Refresh the page.", 4400)
+        return
+    if not hmac.compare_digest(str(hello.get("code", "")).encode(), expected.encode()):
+        await asyncio.sleep(BAD_CODE_DELAY_S)
+        await _reject(ws, "bad_code", "That access code isn't right. Check it and press Start talking again.", 4401)
+        return
+    if _active_sessions >= _max_sessions():
+        await _reject(ws, "busy", f"{_max_sessions()} people are already using the demo. "
+                                  "Please try again in a minute.", 4429)
+        return
+
+    _active_sessions += 1
     session = Session(send_text=ws.send_text, send_bytes=ws.send_bytes)
     turns = asyncio.create_task(session.run())
-    try:
+
+    async def receive_audio():
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
-                break
+                return
             if msg.get("bytes"):
                 session.feed(msg["bytes"])
-    except WebSocketDisconnect:
-        pass
+
+    receiver = asyncio.create_task(receive_audio())
+    try:
+        # Ends when the browser leaves, or when the session ends itself
+        # (turn limit, idle, unrecoverable error).
+        await asyncio.wait({turns, receiver}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        _active_sessions -= 1
         session.disconnect()
         # A turn may be mid-reply; nobody is left to hear it.
-        turns.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await turns
+        for t in (turns, receiver):
+            t.cancel()
+        for t in (turns, receiver):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+        with contextlib.suppress(Exception):
+            await ws.close(code=1000)

@@ -17,6 +17,7 @@ websocket. Live records carry a "measurement" field saying so.
 import asyncio
 import contextlib
 import json
+import os
 from typing import Awaitable, Callable
 
 import httpx
@@ -49,10 +50,49 @@ KEEPALIVE_S = 3.0
 
 SAFETY_NET_BLOCKS = 2500 // MIC_BLOCK_MS
 NO_SPEECH_RESET_BYTES = 2 * MIC_SAMPLE_RATE * 15
+# If audio stops arriving mid-utterance (tab hidden, network stall), end the
+# turn on what we have instead of waiting for blocks that never come.
+AUDIO_STALL_S = 3.0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+# Abuse and cost limits. Read from the environment so tests can lower them
+# (e.g. MAX_TURNS=1) without spending 20 turns of API credit.
+MAX_TURNS = _env_int("MAX_TURNS", 20)            # per connection
+MAX_UTTERANCE_S = _env_int("MAX_UTTERANCE_S", 15)
+MAX_IDLE_S = _env_int("MAX_IDLE_S", 120)         # frees the slot of a forgotten tab
 
 
 class _Disconnected(Exception):
     """The browser went away mid-turn."""
+
+
+class _Idle(Exception):
+    """Nobody spoke for MAX_IDLE_S."""
+
+
+def friendly_error(err: str) -> tuple[str, str, bool]:
+    """Map a raw turn error to (code, message for a non-technical user,
+    terminal). Terminal errors end the session, because retrying the same
+    turn cannot fix them."""
+    low = err.lower()
+    if "401" in err or "403" in err or "unauthorized" in low:
+        service = "speech service" if "deepgram" in low or "websocket" in low else (
+            "language model" if "groq" in low else "AI service")
+        return ("server_misconfigured",
+                f"The {service} rejected the server's API key. This is a problem on our side, "
+                "not yours; please let the presenter know.", True)
+    if "429" in err:
+        return ("rate_limited", "The AI service is busy right now. Wait a few seconds and try again.", False)
+    if "timeout" in low or "connecterror" in low or "connection" in low:
+        return ("turn_failed", "A service took too long to answer. Please try again.", False)
+    return ("turn_failed", "Something went wrong on that turn. You can keep talking.", False)
 
 
 class _DeepgramStream(stt_mod.DeepgramStream):
@@ -199,13 +239,23 @@ class Session:
         speech_started = False
         silent_blocks = 0
         last_speech_ts = None
+        first_speech_ts = None
+        idle_deadline = now() + MAX_IDLE_S
         # Open the gate before announcing it, so a client that starts
         # streaming the instant it sees "listening" loses no audio.
         self.listening = True
         try:
             await self.send_json({"type": "listening"})
             while True:
-                item = await self.audio_in.get()
+                wait = AUDIO_STALL_S if speech_started else max(0.1, idle_deadline - now())
+                try:
+                    item = await asyncio.wait_for(self.audio_in.get(), timeout=wait)
+                except asyncio.TimeoutError:
+                    if not speech_started:
+                        raise _Idle
+                    turn.set(audio_stalled=True)
+                    turn.mark("eot_detected")
+                    break
                 if item is None:
                     raise _Disconnected
                 ts, block = item
@@ -217,9 +267,21 @@ class Session:
                     speech_started = True
                     silent_blocks = 0
                     last_speech_ts = ts
+                    first_speech_ts = first_speech_ts or ts
                     turn.mark("speech_started", ts)
                 elif speech_started:
                     silent_blocks += 1
+
+                if first_speech_ts is not None and ts - first_speech_ts > MAX_UTTERANCE_S:
+                    # Cost and abuse cap. The user may still be talking, so
+                    # this turn's e2e is not a real end-of-speech latency;
+                    # the flag lets analysis exclude it.
+                    turn.set(utterance_capped=True)
+                    turn.mark("eot_detected", ts)
+                    await self.send_json({"type": "notice", "code": "utterance_capped",
+                                          "message": f"That was a long one, so I stopped listening after "
+                                                     f"{MAX_UTTERANCE_S} seconds and answered what I heard."})
+                    break
 
                 ev = self._poll_dg_event()
                 if ev and ev["type"] in ("speech_final", "utterance_end") and self.dg.text():
@@ -376,16 +438,18 @@ class Session:
             reply = await self._respond(user_text, turn)
             turn.set(reply=reply, reply_chars=len(reply))
             await self.send_json({"type": "reply", "text": reply})
-        except _Disconnected:
+        except (_Disconnected, _Idle):
             raise
         except Exception as e:  # noqa: BLE001
             turn.errors.append(f"{type(e).__name__}: {e}")
         return turn
 
     async def run(self):
-        """Turn loop for the lifetime of the connection."""
+        """Turn loop for the lifetime of the connection. Returning ends the
+        session; the server then closes the websocket."""
         await self.open()
         backoff = 1.0
+        turns_done = 0
         try:
             await self.send_json({"type": "ready", "profile": self.p.name})
             while True:
@@ -393,8 +457,21 @@ class Session:
                     turn = await self.run_turn()
                 except _Disconnected:
                     return
+                except _Idle:
+                    await self.send_json({
+                        "type": "error", "code": "idle",
+                        "message": f"Paused after {MAX_IDLE_S} seconds of silence to free the line for "
+                                   "others. Press Start talking to continue."})
+                    return
                 self._save(turn)
+                terminal = False
                 with contextlib.suppress(Exception):
+                    if turn.errors == ["empty_transcript"]:
+                        await self.send_json({"type": "notice", "code": "empty_transcript",
+                                              "message": "I didn't catch that. Please try again."})
+                    elif turn.errors:
+                        code, message, terminal = friendly_error(turn.errors[-1])
+                        await self.send_json({"type": "error", "code": code, "message": message})
                     await self.send_json({"type": "audio_end"})
                     await self.send_json({
                         "type": "metrics",
@@ -404,6 +481,16 @@ class Session:
                         "errors": turn.errors,
                         "measurement": MEASUREMENT,
                     })
+                if terminal:
+                    return
+                if "user_text" in turn.meta:
+                    turns_done += 1
+                    if turns_done >= MAX_TURNS:
+                        await self.send_json({
+                            "type": "error", "code": "turn_limit",
+                            "message": f"This session has reached its {MAX_TURNS}-turn limit. "
+                                       "Press Start talking to begin a new one."})
+                        return
                 if turn.errors and "eot_detected" not in turn.marks:
                     # Failed before the user could even speak (e.g. Deepgram
                     # rejected the handshake). Back off exponentially: a bad

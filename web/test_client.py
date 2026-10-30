@@ -19,6 +19,7 @@ definitions of "last speech block".
 import argparse
 import asyncio
 import json
+import os
 import sys
 import wave
 from pathlib import Path
@@ -81,6 +82,8 @@ async def wait_for(rx: Receiver, etype: str, sink: dict) -> dict:
             # during setup (e.g. Deepgram rejected the key) and will keep
             # failing. Stop instead of waiting forever.
             raise RuntimeError(f"server failed before listening: {ev['errors']}")
+        if ev["type"] == "error" and ev.get("code") in ("server_misconfigured", "idle", "turn_limit"):
+            raise RuntimeError(f"server ended the session: {ev['code']}: {ev['message']}")
 
 
 async def run_prompt(ws, rx: Receiver, prompt: int, save_dir: Path | None) -> dict:
@@ -194,11 +197,14 @@ def report(results: list[dict]) -> bool:
     return ok
 
 
-async def main(url: str, prompts: list[int], save_dir: Path | None) -> int:
+async def main(url: str, prompts: list[int], save_dir: Path | None, code: str) -> int:
     async with websockets.connect(url, max_size=None) as ws:
+        await ws.send(json.dumps({"type": "hello", "code": code}))
         rx = Receiver()
         rx_task = asyncio.create_task(rx.run(ws))
         ready = await asyncio.wait_for(rx.events.get(), timeout=30)
+        if ready["type"] != "ready":
+            raise RuntimeError(f"server refused the session: {ready}")
         print(f"connected: {ready}")
         results = []
         for p in prompts:
@@ -214,8 +220,10 @@ if __name__ == "__main__":
     ap.add_argument("--url", default="ws://127.0.0.1:8000/ws")
     ap.add_argument("--save-audio", type=Path, default=None,
                     help="directory to write each reply as a WAV you can listen to")
+    ap.add_argument("--code", default=os.getenv("ACCESS_CODE", ""),
+                    help="access code (default: ACCESS_CODE from .env)")
     args = ap.parse_args()
     # The Windows console defaults to cp1252, which can't print characters
     # LLM replies often contain (e.g. U+2011 non-breaking hyphen).
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.exit(asyncio.run(main(args.url, args.prompts, args.save_audio)))
+    sys.exit(asyncio.run(main(args.url, args.prompts, args.save_audio, args.code)))
