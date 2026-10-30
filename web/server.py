@@ -62,11 +62,14 @@ def _max_sessions() -> int:
 app = FastAPI(title="voice-agent web demo", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
-if os.getenv("DEMO_DEV_PROMPTS") == "1":
-    # Local testing only: lets an automated browser test feed the recorded
-    # prompts in as a fake microphone. Never enabled on the deployed server
-    # (and data/*.wav isn't in git, so it couldn't be).
-    app.mount("/dev/prompts", StaticFiles(directory=ROOT / "data"), name="dev-prompts")
+# Local testing only. With TEST_MODE=1 the demo page offers "Play recording",
+# which feeds a prompt from data/ through the same AudioWorklet path the
+# microphone uses, so the whole browser pipeline can be tested without
+# speaking. Off unless explicitly set; render.yaml never sets it, and
+# data/*.wav isn't in git, so a deployment couldn't serve the files anyway.
+TEST_MODE = os.getenv("TEST_MODE") == "1"
+if TEST_MODE:
+    app.mount("/test/prompts", StaticFiles(directory=ROOT / "data"), name="test-prompts")
 
 
 @app.get("/")
@@ -88,7 +91,8 @@ async def chart(name: str):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "sessions": _active_sessions, "max_sessions": _max_sessions()}
+    return {"ok": True, "sessions": _active_sessions, "max_sessions": _max_sessions(),
+            "test_mode": TEST_MODE}
 
 
 async def _reject(ws: WebSocket, code: str, message: str, close_code: int):

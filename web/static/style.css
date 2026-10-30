@@ -67,8 +67,40 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .table-scroll { overflow-x: auto; }
 img { max-width: 100%; height: auto; }
 
+/* ---------- landing page ---------- */
+.hero { padding: 40px 0 8px; }
+.hero h1 { font-size: clamp(1.7rem, 4.5vw, 2.6rem); line-height: 1.15; margin: 0 0 14px; }
+.hero .hl { color: var(--accent); }
+.lede { font-size: 1.1rem; max-width: 46em; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0; }
+h2 { font-size: 1.35rem; margin-top: 0; }
+h3 { font-size: 1.05rem; margin: 0 0 8px; }
+.section-title { margin: 32px 0 4px; }
+.flow { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); counter-reset: step; }
+.flow li { position: relative; border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--bg); }
+.flow li strong { display: block; margin-bottom: 4px; }
+.flow li strong::before { counter-increment: step; content: counter(step) ". "; color: var(--accent); }
+.flow li span { font-size: 0.875rem; color: var(--muted); }
+tr.win td { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.charts { display: grid; gap: 0 16px; grid-template-columns: 1fr; }
+@media (min-width: 860px) { .charts { grid-template-columns: 1fr 1fr; } }
+.charts figure { margin: 16px 0; }
+.charts img { background: #fff; border-radius: 6px; }
+.two-col { display: grid; gap: 0 24px; grid-template-columns: 1fr; }
+@media (min-width: 700px) { .two-col { grid-template-columns: 1fr 1fr; } }
+.grid-cards { display: grid; gap: 0 16px; grid-template-columns: 1fr; }
+@media (min-width: 700px) { .grid-cards { grid-template-columns: 1fr 1fr; } }
+.grid-cards .card p { margin-bottom: 0; }
+.video-placeholder { aspect-ratio: 16 / 9; display: grid; place-items: center; border-radius: 10px;
+                     background: var(--code-bg); color: var(--muted); font-weight: 600; }
+.foot { padding: 8px 16px 40px; }
+
 /* ---------- demo page ---------- */
 .demo-grid { display: grid; grid-template-columns: 1fr; gap: 0 16px; }
+/* Grid items default to min-width:auto and won't shrink below their widest
+   content (the turns table), which overflows phones. */
+.demo-grid > *, .charts > *, .two-col > *, .grid-cards > * { min-width: 0; }
 @media (min-width: 860px) { .demo-grid { grid-template-columns: 1.1fr 1fr; } }
 .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .controls input {
@@ -84,6 +116,8 @@ img { max-width: 100%; height: auto; }
 @keyframes pulse { 50% { opacity: 0.35; } }
 .meter { height: 6px; background: var(--code-bg); border-radius: 3px; overflow: hidden; margin-top: 10px; }
 .meter > div { height: 100%; width: 0; background: var(--good); transition: width 60ms linear; }
+.test-panel { border-style: dashed; border-color: var(--warn); }
+.test-panel select { font: inherit; padding: 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
 .notice { margin-top: 12px; padding: 10px 12px; border-radius: 10px; display: none; }
 .notice.info { display: block; background: var(--code-bg); }
 .notice.error { display: block; background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--text); }

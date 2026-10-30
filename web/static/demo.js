@@ -55,6 +55,8 @@ let serverListening = false;
 let playEnd = 0;           // AudioContext time when queued reply audio finishes
 let turn = null;           // browser-side record of the current turn
 let turnCount = 0;
+let testMode = false;      // set from /health; only true when the server has TEST_MODE=1
+let startToken = 0;
 
 function newTurn() {
   return { lastSpeech: null, speechEnd: null, firstSound: null, audioEnded: false, text: "" };
@@ -72,6 +74,7 @@ function setState(s, text) {
   $("status").textContent = text || labels[s] || s;
   $("dot").className = "dot " + ({ listening: "listening", thinking: "thinking", speaking: "speaking", error: "error", reconnecting: "error" }[s] || "");
   $("talk").textContent = userStopped ? "Start talking" : "Stop";
+  $("test-play").disabled = s !== "listening";
 }
 
 function notice(msg, kind = "info") {
@@ -135,10 +138,20 @@ async function startAudio() {
   if (ctx) return;
   ctx = new AudioContext({ latencyHint: "interactive" });
   await ctx.audioWorklet.addModule("/static/mic-worklet.js");
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
-  const src = ctx.createMediaStreamSource(micStream);
+  let src;
+  if (testMode) {
+    // TEST_MODE: no microphone. A constant zero signal stands in for a
+    // quiet room so the worklet produces blocks continuously, exactly as an
+    // open mic does; playTestPrompt() adds a recording on top.
+    src = ctx.createConstantSource();
+    src.offset.value = 0;
+    src.start();
+  } else {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    src = ctx.createMediaStreamSource(micStream);
+  }
   micNode = new AudioWorkletNode(ctx, "mic-downsampler");
   // A worklet only runs while its output is pulled; route it to the
   // speakers through a muted gain so it's pulled without being heard.
@@ -146,7 +159,27 @@ async function startAudio() {
   mute.gain.value = 0;
   src.connect(micNode).connect(mute).connect(ctx.destination);
   micNode.port.onmessage = (e) => onMicBlock(e.data);
-  if (ctx.state === "suspended") await ctx.resume();
+  // Don't await: if the browser's autoplay policy holds the context
+  // suspended (no user gesture yet), resume() never settles and Start would
+  // hang. The click listener below retries on the next interaction.
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});
+}
+
+document.addEventListener("click", () => { if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {}); });
+
+// TEST_MODE only: play data/prompt_NN.wav into the worklet as if spoken.
+// decodeAudioData resamples the 16 kHz file to the context rate (usually
+// 48 kHz), so the worklet's anti-aliasing + downsampling runs for real.
+async function playTestPrompt(n) {
+  if (!ctx || !micNode) throw new Error("press Start talking first");
+  const r = await fetch(`/test/prompts/prompt_${String(n).padStart(2, "0")}.wav`);
+  if (!r.ok) throw new Error(`recording ${n} not found (HTTP ${r.status})`);
+  const buf = await ctx.decodeAudioData(await r.arrayBuffer());
+  const s = ctx.createBufferSource();
+  s.buffer = buf;
+  s.connect(micNode);
+  s.start();
+  return buf.duration;
 }
 
 function stopAudio() {
@@ -284,8 +317,7 @@ function connect() {
       // let it finish playing before releasing the speakers and mic.
       userStopped = true;
       const remainingMs = ctx ? Math.max(0, (playEnd - ctx.currentTime) * 1000) : 0;
-      setTimeout(stopAudio, remainingMs + 200);
-      setState("error", "Stopped");
+      setTimeout(() => { stopAudio(); setState("error", "Stopped"); }, remainingMs + 200);
       return;
     }
     if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) { giveUp(); return; }
@@ -309,26 +341,36 @@ async function start() {
   if (!code) { notice("Enter the access code first.", "error"); $("code").focus(); return; }
   try { localStorage.setItem("va_code", code); } catch (_) {}
   userStopped = false; terminalError = null; reconnectAttempt = 0;
+  // Each start gets a token; stop() bumps it. After every await we check it,
+  // so pressing Stop while starting cancels cleanly instead of the aborted
+  // start reporting a bogus "couldn't start the microphone" error.
+  const token = ++startToken;
+  const cancelled = () => token !== startToken;
   notice(null);
   setState("connecting");
   try {
     await startAudio();
   } catch (err) {
+    if (cancelled()) return;
     userStopped = true; stopAudio(); setState("error");
     notice(err && err.name === "NotAllowedError"
       ? "Microphone access was blocked. Allow it in the address bar and press Start again."
       : `Couldn't start the microphone (${err && err.message ? err.message : err}).`, "error");
     return;
   }
+  if (cancelled()) return;
   if (!(await wakeServer())) {
+    if (cancelled()) return;
     userStopped = true; stopAudio(); setState("error");
     notice("The server didn't respond. Try again in a minute.", "error");
     return;
   }
+  if (cancelled()) return;
   connect();
 }
 
 function stop() {
+  startToken++;
   userStopped = true;
   clearTimeout(reconnectTimer);
   if (ws) ws.close(1000);
@@ -339,3 +381,12 @@ function stop() {
 $("talk").addEventListener("click", () => (userStopped ? start() : stop()));
 try { $("code").value = localStorage.getItem("va_code") || ""; } catch (_) {}
 setState("idle");
+
+fetch("/health", { cache: "no-store" }).then((r) => r.json()).then((h) => {
+  if (!h.test_mode) return;
+  testMode = true;
+  for (let i = 1; i <= 20; i++) $("test-prompt").add(new Option(`prompt_${String(i).padStart(2, "0")}.wav`, i));
+  $("test-panel").hidden = false;
+  $("test-play").addEventListener("click", () =>
+    playTestPrompt(+$("test-prompt").value).catch((err) => notice(`Test playback failed: ${err.message}`, "error")));
+}).catch(() => {});

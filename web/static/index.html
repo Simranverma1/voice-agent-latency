@@ -1,6 +1,190 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Voice Agent</title><link rel="stylesheet" href="/static/style.css"></head>
-<body><main class="wrap"><div class="card"><a class="btn" href="/demo">Open the live demo</a></div></main></body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Low-Latency Voice Agent</title>
+  <meta name="description" content="A real-time voice assistant, instrumented end to end: where the seconds go, and how streaming cut the median response time from 9.6 s to 3.4 s.">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/">Low-latency voice agent</a>
+    <nav><a href="#results">Results</a><a href="#failures">Lessons</a><a href="/demo">Live demo</a></nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section class="hero">
+    <h1>A voice assistant that answers in <span class="hl">3.4 seconds</span> instead of 9.6</h1>
+    <p class="lede">
+      Talking to an AI only feels natural if it answers quickly. This project builds a
+      voice assistant, measures exactly where every millisecond goes between you stopping
+      talking and you hearing a reply, and then removes the waiting, one change at a time.
+    </p>
+    <div class="cta">
+      <a class="btn" href="/demo">Try the live demo</a>
+      <a class="btn secondary" href="https://github.com/Simranverma1/voice-agent-latency">Source code on GitHub</a>
+    </div>
+    <p class="muted small">
+      <span class="badge bench">BENCHMARK</span> Median time from end of speech to first sound,
+      20 recorded questions, laptop in India calling AI services hosted in the US.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>The problem</h2>
+    <p>
+      In a conversation, people expect a reply within about a second. A typical voice assistant
+      instead runs four slow steps one after another: wait to be sure you've finished talking,
+      turn your speech into text, have a language model write an answer, and turn that answer
+      back into speech. Each step waits for the previous one to finish completely, so the delays
+      stack up. Our first version took a median of <strong>9.6 seconds</strong> to start answering.
+    </p>
+    <p style="margin-bottom:0">
+      The goal was not just a faster number, but to <em>measure</em> each step precisely, so every
+      improvement can be explained and attributed to one specific change.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>How it works</h2>
+    <ol class="flow" aria-label="Pipeline">
+      <li><strong>Your microphone</strong><span>The browser cleans up and shrinks the audio to 16 kHz and streams it live.</span></li>
+      <li><strong>Speech to text</strong><span>Deepgram transcribes <em>while</em> you talk and decides when you've stopped (300 ms of silence).</span></li>
+      <li><strong>Language model</strong><span>Groq's <code>gpt-oss-20b</code> writes the answer and sends it word by word.</span></li>
+      <li><strong>Sentence chunker</strong><span>As soon as the first phrase is complete, it's sent on. No waiting for the full answer.</span></li>
+      <li><strong>Text to speech</strong><span>Deepgram Aura voices each phrase; requests overlap so there are no gaps.</span></li>
+      <li><strong>Your speaker</strong><span>Audio plays back-to-back in the browser while the rest is still being made.</span></li>
+    </ol>
+    <p class="muted small" style="margin-bottom:0">
+      Every arrow above is timestamped on one clock, so the time spent in each step is measured,
+      not estimated.
+    </p>
+  </section>
+
+  <section id="results">
+    <h2 class="section-title">Results <span class="badge bench">BENCHMARK</span></h2>
+    <p class="muted">
+      The same 20 recorded questions were replayed into five versions of the pipeline. Each
+      version adds exactly one change, so the saving from each change can be measured on its own.
+      100 turns were attempted and 90 succeeded; the failures were network errors (see below).
+    </p>
+
+    <div class="card">
+      <h3>Before and after</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th></th><th class="num">Before (v1)</th><th class="num">After (v5)</th><th class="num">Change</th></tr></thead>
+          <tbody>
+            <tr><td>Median time to first sound</td><td class="num">9563 ms</td><td class="num">3439 ms</td><td class="num"><strong>−6124 ms (64% faster)</strong></td></tr>
+            <tr><td>Slowest 5% (p95)</td><td class="num">14615 ms</td><td class="num">4503 ms</td><td class="num"><strong>−10113 ms (69% faster)</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>One change at a time</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Version</th><th>What changed</th><th class="num">Median</th><th class="num">Saved</th><th class="num">p95</th><th class="num">n</th></tr></thead>
+          <tbody>
+            <tr><td>v1</td><td>Baseline: every step waits for the previous one; larger, slower model (<code>gpt-oss-120b</code>)</td><td class="num">9563 ms</td><td class="num">—</td><td class="num">14615 ms</td><td class="num">20</td></tr>
+            <tr><td>v2</td><td>Smaller, faster model (<code>gpt-oss-20b</code>), still waiting for the whole answer</td><td class="num">8340 ms</td><td class="num">−1223 ms</td><td class="num">14388 ms</td><td class="num">20</td></tr>
+            <tr class="win"><td>v3</td><td>Stream the answer phrase by phrase into speech, with overlapping requests</td><td class="num">5358 ms</td><td class="num"><strong>−2982 ms</strong></td><td class="num">10896 ms</td><td class="num">20</td></tr>
+            <tr><td>v4</td><td>Transcribe while the user is still talking (streaming speech-to-text)</td><td class="num">4158 ms</td><td class="num">−1200 ms</td><td class="num">6862 ms</td><td class="num">13</td></tr>
+            <tr><td>v5</td><td>Let the speech service detect the end of speech (300 ms) instead of a fixed 1.5 s silence timer</td><td class="num">3439 ms</td><td class="num">−719 ms</td><td class="num">4503 ms</td><td class="num">17</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small" style="margin-bottom:0">
+        <strong>The biggest win (v2 → v3) needed no faster model and no new vendor.</strong>
+        The baseline waited for the entire answer to be written and turned into a complete
+        audio file before playing a single sound, even though you only notice the wait until the
+        <em>first</em> sound. Starting to speak after the first phrase removed most of that wait.
+        It's purely a change in scheduling.
+      </p>
+    </div>
+
+    <div class="charts">
+      <figure class="card">
+        <img src="/reports/distribution.png" alt="Box plot of time to first sound for each of the five versions; the spread shrinks along with the median from v1 to v5." loading="lazy">
+        <figcaption class="muted small">How the time to first sound is spread across all turns, per version. Lower and narrower is better.</figcaption>
+      </figure>
+      <figure class="card">
+        <img src="/reports/breakdown.png" alt="Stacked bars showing the typical time in each pipeline step for the five versions." loading="lazy">
+        <figcaption class="muted small">
+          Where the time goes: the typical (median) time in each step, per version. Within any
+          single turn the steps add up exactly to its total; medians of the steps don't add up
+          exactly to the median total, so read these as typical shares.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="measurement" class="card">
+    <h2>How it's measured</h2>
+    <div class="two-col">
+      <div>
+        <p><span class="badge bench">BENCHMARK</span></p>
+        <p class="small">
+          20 recorded questions replayed in real time on a laptop in India, calling US-hosted
+          services. The clock starts at the last moment of real sound in the recording and stops
+          when the first reply audio goes to the sound card. Identical audio for every version,
+          so differences come from the pipeline, not the speaker.
+        </p>
+      </div>
+      <div>
+        <p><span class="badge live">LIVE</span></p>
+        <p class="small">
+          The live demo runs the final version (v5) on a server, and shows two numbers for every
+          turn: the <strong>server's</strong> time (your speech end arriving → first reply audio sent) and the
+          <strong>browser's</strong> time (you stop talking → reply audio starts playing). The gap between them
+          is the internet trip to the server plus audio buffering. Live numbers depend on your
+          connection and are not directly comparable with the benchmark.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section id="failures">
+    <h2 class="section-title">Problems I diagnosed along the way</h2>
+    <p class="muted">Every one of these was found by reading the per-turn timelines, not by guessing.</p>
+    <div class="grid-cards">
+      <div class="card"><h3>Silent gaps mid-sentence</h3><p class="small">On a slow link, a short phrase finished playing before the next phrase's audio had even started arriving. Fix: request each phrase's audio the moment its text is ready, and play results strictly in order.</p></div>
+      <div class="card"><h3>Streaming connections dying silently</h3><p class="small">A dropped live-transcription connection returned empty transcripts forever without raising an error. Fix: rebuild it after an empty result. Even so, the streaming versions completed fewer turns (13/20 and 17/20), a real reliability cost of streaming.</p></div>
+      <div class="card"><h3>Requests that never time out</h3><p class="small">A connection that trickles data never trips a per-read timeout. Fix: an overall 20-second deadline per streamed response, plus one retry on temporary network errors.</p></div>
+      <div class="card"><h3>A speech detector that never heard speech</h3><p class="small">The detector learns the room's noise level from the first half-second. The recordings started mid-word, so it learned "speech = background" and waited forever. Fix: feed it 600 ms of silence first.</p></div>
+      <div class="card"><h3>The agent hearing itself</h3><p class="small">In the browser, the microphone can pick up the agent's own voice and answer it. Fix: the page stops sending microphone audio until the reply has finished playing.</p></div>
+      <div class="card"><h3>"When did you stop talking?" is a judgement call</h3><p class="small">Two reasonable loudness thresholds disagreed by 0.3–2.1 seconds on quiet recordings. That uncertainty sits inside every latency number, including the benchmark's.</p></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Honest limitations</h2>
+    <ul class="small" style="margin-bottom:0">
+      <li>Every version uses the same two providers (Groq and Deepgram), so this is an architecture comparison, not a vendor comparison.</li>
+      <li>All benchmark turns came from one location in one session; network quality varies by time of day.</li>
+      <li>The recordings are clean: no background noise, accents or crosstalk.</li>
+      <li>Speech synthesis started noticeably slower in the streaming versions (~940–1000 ms vs ~340–480 ms). The cause is not yet isolated.</li>
+      <li>The biggest remaining live delay is waiting for each phrase's full audio before sending it. Streaming within a phrase is the obvious next step.</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>Demo video</h2>
+    <!-- Replace this placeholder with the video embed, e.g. a YouTube <iframe>. -->
+    <div class="video-placeholder">Video coming soon</div>
+  </section>
+
+</main>
+
+<footer class="wrap muted small foot">
+  <a href="https://github.com/Simranverma1/voice-agent-latency">github.com/Simranverma1/voice-agent-latency</a>
+  · Full write-up in REPORT.md · Built with help from Claude Code as a coding assistant.
+</footer>
+</body>
 </html>

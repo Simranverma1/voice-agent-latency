@@ -292,6 +292,12 @@ class Session:
                     turn.mark("eot_detected", ts)
                     break
 
+                # Idle means no *speech*, not no audio: a browser streams room
+                # noise continuously, so the queue timeout above alone would
+                # never fire and a forgotten tab would hold a slot forever.
+                if not speech_started and ts > idle_deadline:
+                    raise _Idle
+
                 # pipeline.py:112 gives up after 15 s of no speech. A browser
                 # mic stays open indefinitely, so just drop the silence to
                 # bound memory and keep listening.

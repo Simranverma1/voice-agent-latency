@@ -10,6 +10,7 @@ limit is exercised without spending 20 turns of API credit.
 """
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -174,6 +175,31 @@ async def free_checks():
               bool(idle) and srv.health()["sessions"] == 0,
               f"(closed after {time.monotonic() - t0:.1f} s with MAX_IDLE_S=3; message {idle[0]['message']!r})"
               if idle else f"(events: {events})")
+
+        # Regression: a real browser never stops sending audio (room noise),
+        # so idle must be judged on speech, not on blocks arriving.
+        d = await open_session(srv.url)
+
+        async def send_silence():
+            with contextlib.suppress(websockets.ConnectionClosed):
+                while True:
+                    await d.send(b"\x00" * MIC_BLOCK_BYTES)
+                    await asyncio.sleep(MIC_BLOCK_MS / 1000)
+
+        sender = asyncio.create_task(send_silence())
+        t0 = time.monotonic()
+        events = []
+        try:
+            while True:
+                events.append(await next_event(d, timeout=20))
+        except (websockets.ConnectionClosed, asyncio.TimeoutError):
+            pass
+        sender.cancel()
+        idle = [e for e in events if e.get("code") == "idle"]
+        await asyncio.sleep(1.0)
+        check("a session streaming silence is still closed after MAX_IDLE_S",
+              bool(idle) and srv.health()["sessions"] == 0,
+              f"(closed after {time.monotonic() - t0:.1f} s)" if idle else f"(events: {[e['type'] for e in events]})")
 
     with Server(8102, ACCESS_CODE="") as srv:
         await expect_refusal(srv.url, "", "server_misconfigured", "no ACCESS_CODE on the server = closed to everyone")

@@ -32,6 +32,18 @@
         <div id="notice" class="notice" role="status"></div>
       </div>
 
+      <div id="test-panel" class="card test-panel" hidden>
+        <strong>TEST MODE</strong>
+        <p class="muted small">
+          The microphone is replaced by a recorded prompt, fed through the same audio path
+          (AudioWorklet → 16 kHz → server). Only available when the server runs with TEST_MODE=1.
+        </p>
+        <div class="controls">
+          <select id="test-prompt" aria-label="Recording"></select>
+          <button id="test-play" class="btn secondary" disabled>Play recording</button>
+        </div>
+      </div>
+
       <div class="card">
         <h2 style="margin-top:0;font-size:1.1rem">Conversation</h2>
         <div id="log" class="log"><p class="muted small" id="log-empty">Nothing yet.</p></div>
