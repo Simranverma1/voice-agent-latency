@@ -7,3 +7,6 @@ numpy>=2.1
 pandas>=2.2
 matplotlib>=3.8
 python-dotenv>=1.0
+# Web demo server (web/)
+fastapi>=0.115
+uvicorn>=0.30
