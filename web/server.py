@@ -62,6 +62,18 @@ def _max_sessions() -> int:
 app = FastAPI(title="voice-agent web demo", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+
+@app.middleware("http")
+async def revalidate(request, call_next):
+    # Without a Cache-Control header Chrome guesses a freshness lifetime from
+    # Last-Modified and reuses files without asking, so after an update a
+    # visitor could get the old demo.html with the new demo.js. "no-cache"
+    # makes it revalidate every time; unchanged files still come back as a
+    # cheap 304 thanks to the ETag.
+    response = await call_next(request)
+    response.headers.setdefault("Cache-Control", "no-cache")
+    return response
+
 # Local testing only. With TEST_MODE=1 the demo page offers "Play recording",
 # which feeds a prompt from data/ through the same AudioWorklet path the
 # microphone uses, so the whole browser pipeline can be tested without

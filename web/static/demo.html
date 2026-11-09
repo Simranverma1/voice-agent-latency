@@ -21,7 +21,7 @@
         <h1 style="margin-top:0;font-size:1.5rem">Talk to the agent</h1>
         <p class="muted small" style="margin-top:0">
           Press start, allow the microphone, and ask a question. Pause when you're done
-          and the agent replies out loud. Headphones work best.
+          and the agent replies out loud. Works through speakers; headphones give the cleanest audio.
         </p>
         <div class="controls">
           <input id="code" type="password" autocomplete="off" placeholder="Access code" aria-label="Access code">
@@ -29,6 +29,11 @@
         </div>
         <div class="status"><span id="dot" class="dot"></span><span id="status">Not connected</span></div>
         <div class="meter" aria-hidden="true"><div id="level"></div></div>
+        <div id="mic-row" class="mic-row small" hidden>
+          <label for="mic-select" class="muted">Microphone</label>
+          <select id="mic-select"></select>
+        </div>
+        <div id="mic-hint" class="notice" role="status"></div>
         <div id="notice" class="notice" role="status"></div>
       </div>
 

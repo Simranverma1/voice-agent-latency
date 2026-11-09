@@ -9,6 +9,12 @@ const TTS_RATE = 24000;
 const WAKE_POLL_MS = 3000;
 const WAKE_GIVE_UP_MS = 120000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+// Mic health check. A muted or wrong input device (e.g. an unplugged headset
+// still set as Chrome's default) delivers digital silence, and the page would
+// otherwise just sit at "Listening" forever. Below MIC_DEAD_RMS counts as no
+// signal at all: real rooms, even after noise suppression, sit well above it.
+const MIC_DEAD_RMS = 4;
+const MIC_SILENT_WARN_MS = 5000;
 // Server error codes after which reconnecting would not help.
 const TERMINAL_ERRORS = new Set(["bad_code", "busy", "turn_limit", "idle", "server_misconfigured"]);
 
@@ -24,31 +30,8 @@ const SEGMENTS = [
 
 const $ = (id) => document.getElementById(id);
 
-// Same rule as web/vad.py and agent/audio_io.py: calibrate on the first
-// 25 blocks, then speech = energy above 3.5x the ambient floor. Fed the
-// exact blocks sent to the server, so both sides agree on "speech".
-class EnergyVAD {
-  constructor(multiplier = 3.5, floorMin = 180, calibBlocks = 25) {
-    this.multiplier = multiplier; this.floorMin = floorMin; this.calibBlocks = calibBlocks;
-    this.samples = []; this.threshold = floorMin * multiplier;
-  }
-  isSpeech(rms) {
-    if (this.samples.length < this.calibBlocks) {
-      this.samples.push(rms);
-      if (this.samples.length === this.calibBlocks) {
-        const s = [...this.samples].sort((a, b) => a - b);
-        const mid = s.length / 2;
-        const median = s.length % 2 ? s[Math.floor(mid)] : (s[mid - 1] + s[mid]) / 2;
-        this.threshold = Math.max(median, this.floorMin) * this.multiplier;
-      }
-      return false;
-    }
-    return rms > this.threshold;
-  }
-}
-
-let ctx = null, micStream = null, micNode = null;
-let ws = null, vad = null;
+let ctx = null, micStream = null, micNode = null, micSource = null;
+let ws = null;
 let state = "idle";
 let userStopped = true, terminalError = null, reconnectAttempt = 0, reconnectTimer = null;
 let serverListening = false;
@@ -57,9 +40,23 @@ let turn = null;           // browser-side record of the current turn
 let turnCount = 0;
 let testMode = false;      // set from /health; only true when the server has TEST_MODE=1
 let startToken = 0;
+let micLabel = "";
+let lastMicSound = 0;      // performance.now() of the last block with any signal
 
+// The browser has no speech detector of its own: the server says how many
+// bytes into this listen your speech ended (transcript.speech_end_byte), and
+// sendLog says when this browser sent that byte. Both sides then time from
+// the same decision, so browser − server is network plus playback only. (A
+// separate browser VAD used to do this and missed every turn of a session.)
 function newTurn() {
-  return { lastSpeech: null, speechEnd: null, firstSound: null, audioEnded: false, text: "" };
+  return { sentBytes: 0, sendLog: [], speechEnd: null, firstSound: null, audioEnded: false,
+           text: "", pendingText: [], fullReply: null };
+}
+
+function sentAt(t, byte) {
+  if (byte == null) return null;
+  for (const [n, time] of t.sendLog) if (n >= byte) return time;
+  return null;
 }
 
 // ------------------------------------------------------------------- UI
@@ -147,11 +144,11 @@ async function startAudio() {
     src.offset.value = 0;
     src.start();
   } else {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    src = ctx.createMediaStreamSource(micStream);
+    micStream = await openMic();
+    src = micSource = ctx.createMediaStreamSource(micStream);
+    showMics();
   }
+  lastMicSound = performance.now();
   micNode = new AudioWorkletNode(ctx, "mic-downsampler");
   // A worklet only runs while its output is pulled; route it to the
   // speakers through a muted gain so it's pulled without being heard.
@@ -166,6 +163,99 @@ async function startAudio() {
 }
 
 document.addEventListener("click", () => { if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {}); });
+
+// ------------------------------------------------------------ microphone
+const MIC_CONSTRAINTS = { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+
+function savedMic() {
+  try { return localStorage.getItem("va_mic") || ""; } catch (_) { return ""; }
+}
+
+function getMic(deviceId) {
+  return navigator.mediaDevices.getUserMedia({
+    audio: deviceId ? { ...MIC_CONSTRAINTS, deviceId: { exact: deviceId } } : MIC_CONSTRAINTS,
+  });
+}
+
+// Opens the mic chosen in the list, else the browser's default, else any
+// input that works. Windows sometimes refuses to start a device ("Could not
+// start audio source": another app holds it, or a Bluetooth headset is
+// switching modes); trying the other inputs turns that dead end into a
+// working mic, and the list shows which one was used.
+async function openMic() {
+  const preferred = savedMic();
+  let firstErr = null;
+  for (const id of preferred ? [preferred, ""] : [""]) {
+    try { return await getMic(id); } catch (e) {
+      if (e.name === "NotAllowedError") throw e;
+      firstErr = firstErr || e;
+    }
+  }
+  await new Promise((r) => setTimeout(r, 400));   // a just-released device can need a moment
+  const inputs = (await navigator.mediaDevices.enumerateDevices())
+    .filter((d) => d.kind === "audioinput" && d.deviceId && d.deviceId !== "communications");
+  for (const d of inputs) {
+    try { return await getMic(d.deviceId); } catch (e) {
+      if (e.name === "NotAllowedError") throw e;
+    }
+  }
+  throw firstErr;
+}
+
+// Fills the microphone list. Labels are only available once the page has
+// microphone permission, so before that the list stays hidden.
+async function showMics() {
+  const track = micStream && micStream.getAudioTracks()[0];
+  micLabel = track ? track.label : micLabel;
+  const current = track ? track.getSettings().deviceId : savedMic();
+  let inputs = [];
+  try {
+    inputs = (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === "audioinput" && d.deviceId && d.label && d.deviceId !== "communications");
+  } catch (_) {}
+  if (!inputs.length) return;
+  const sel = $("mic-select");
+  sel.innerHTML = "";
+  for (const d of inputs) {
+    const o = document.createElement("option");
+    o.value = d.deviceId;
+    o.textContent = d.label;
+    sel.appendChild(o);
+  }
+  if (inputs.some((d) => d.deviceId === current)) sel.value = current;
+  $("mic-row").hidden = false;
+}
+
+$("mic-select").addEventListener("change", async (e) => {
+  const id = e.target.value;
+  try { localStorage.setItem("va_mic", id); } catch (_) {}
+  if (!ctx || !micNode || testMode) return;   // takes effect on the next Start
+  const myCtx = ctx;
+  let stream;
+  try { stream = await getMic(id); } catch (err) { notice(micErrorMessage(err), "error"); return; }
+  if (ctx !== myCtx) { stream.getTracks().forEach((t) => t.stop()); return; }   // stopped meanwhile
+  if (micSource) micSource.disconnect();
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  micStream = stream;
+  micSource = ctx.createMediaStreamSource(stream);
+  micSource.connect(micNode);
+  lastMicSound = performance.now();
+  notice(null);
+  showMics();
+});
+
+function micErrorMessage(err) {
+  const name = err && err.name;
+  if (name === "NotAllowedError") return "Microphone access was blocked. Allow it in the address bar and press Start again.";
+  // Permission was fine but the OS couldn't open the device: on Windows this
+  // is usually another app holding the mic in exclusive mode.
+  if (name === "NotReadableError") {
+    return "Couldn't open any microphone: they seem to be busy. Close other apps that use the mic " +
+      "(Zoom, Teams, Discord, the Windows Sound settings window), then press Start again.";
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError") return "No microphone was found. Plug one in and press Start again.";
+  return `Couldn't start the microphone (${err && err.message ? err.message : err}).`;
+}
 
 // TEST_MODE only: play data/prompt_NN.wav into the worklet as if spoken.
 // decodeAudioData resamples the 16 kHz file to the context rate (usually
@@ -185,16 +275,33 @@ async function playTestPrompt(n) {
 function stopAudio() {
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
   if (ctx) ctx.close();
-  ctx = null; micStream = null; micNode = null; playEnd = 0;
+  ctx = null; micStream = null; micNode = null; micSource = null; playEnd = 0;
+  micHint(null);
+}
+
+function micHint(msg) {
+  const h = $("mic-hint");
+  if (h.textContent === (msg || "")) return;
+  h.className = msg ? "notice error" : "notice";
+  h.textContent = msg || "";
+}
+
+// Logarithmic: speech spans roughly 100-4000 rms, and on a linear scale quiet
+// speech barely moved the bar, so a working mic looked dead.
+function levelPercent(rms) {
+  const lo = Math.log(20), hi = Math.log(4000);
+  return Math.max(0, Math.min(100, ((Math.log(Math.max(rms, 1)) - lo) / (hi - lo)) * 100));
 }
 
 function onMicBlock({ pcm, rms }) {
-  $("level").style.width = `${Math.min(100, (rms / 4000) * 100)}%`;
+  $("level").style.width = `${levelPercent(rms)}%`;
+  if (rms >= MIC_DEAD_RMS) lastMicSound = performance.now();
   // Half-duplex: send only while the server is listening AND the reply has
   // finished playing, otherwise the agent would hear (and answer) itself.
   if (state !== "listening" || !ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(pcm);
-  if (vad.isSpeech(rms)) turn.lastSpeech = performance.now();
+  turn.sentBytes += pcm.byteLength;
+  turn.sendLog.push([turn.sentBytes, performance.now()]);
 }
 
 function playFrame(buf) {
@@ -211,11 +318,23 @@ function playFrame(buf) {
   const startAt = Math.max(playEnd, ctx.currentTime + (first ? PLAYBACK_LEAD_S : 0.02));
   src.start(startAt);
   playEnd = startAt + audio.duration;
-  if (first) {
-    const outLatency = ctx.outputLatency || ctx.baseLatency || 0;
-    turn.firstSound = performance.now() + (startAt - ctx.currentTime + outLatency) * 1000;
+  const outLatency = ctx.outputLatency || ctx.baseLatency || 0;
+  const audibleIn = (startAt - ctx.currentTime + outLatency) * 1000;
+  if (first) turn.firstSound = performance.now() + audibleIn;
+  // The server sends each sentence's text just before its audio, and audio
+  // arrives faster than it plays, so show the text when this frame is heard.
+  if (turn && turn.pendingText.length) {
+    const text = turn.pendingText.splice(0).join(" ");
+    const t = turn;
+    setTimeout(() => showReplyText(t, text), Math.max(0, audibleIn));
   }
   if (state !== "speaking") setState("speaking");
+}
+
+function showReplyText(t, text) {
+  if (t.textDone) return;   // finishReplyText already showed the whole reply
+  if (!t.agentBubble) t.agentBubble = bubble("agent", text);
+  else t.agentBubble.textContent += " " + text;
 }
 
 function isPlaying() {
@@ -230,8 +349,35 @@ function maybeStartListening() {
 }
 
 setInterval(() => {
+  if (turn && turn.audioEnded && !isPlaying()) finishReplyText(turn);
   if (state === "speaking" && !isPlaying() && turn && turn.audioEnded) maybeStartListening();
+  checkMic();
 }, 100);
+
+// Once the voice has finished, show the exact full reply (the per-sentence
+// pieces are the TTS chunks, whose whitespace can differ from the LLM text).
+// Also covers a reply whose audio failed and so never revealed its text.
+function finishReplyText(t) {
+  if (t.fullReply == null) return;
+  if (!t.agentBubble) t.agentBubble = bubble("agent", t.fullReply);
+  else t.agentBubble.textContent = t.fullReply;
+  t.fullReply = null; t.pendingText = []; t.textDone = true;
+}
+
+// Runs on a timer, not per block: a suspended AudioContext delivers no blocks
+// at all, so a per-block check would never fire in exactly that case.
+function checkMic() {
+  if (state !== "listening" || testMode || !ctx) { micHint(null); return; }
+  if (ctx.state === "suspended") {
+    lastMicSound = performance.now();   // the mic can't be judged while paused
+    micHint("Your browser has paused audio on this page. Click anywhere on the page to turn it on.");
+  } else if (performance.now() - lastMicSound > MIC_SILENT_WARN_MS) {
+    micHint(`No sound is coming from your microphone${micLabel ? ` (${micLabel})` : ""}. ` +
+      "Check it isn't muted, or choose another one in the Microphone list above.");
+  } else {
+    micHint(null);
+  }
+}
 
 // ------------------------------------------------------------- connection
 async function wakeServer() {
@@ -266,7 +412,7 @@ function connect() {
     const ev = JSON.parse(e.data);
     switch (ev.type) {
       case "ready":
-        reconnectAttempt = 0; terminalError = null; vad = new EnergyVAD();
+        reconnectAttempt = 0; terminalError = null;
         notice(null); setState("ready");
         break;
       case "listening":
@@ -279,19 +425,17 @@ function connect() {
       case "transcript":
         serverListening = false;
         if (!turn) turn = newTurn();
-        turn.speechEnd = turn.lastSpeech;
+        turn.speechEnd = sentAt(turn, ev.speech_end_byte);
         turn.text = ev.text;
         turn.agentBubble = null;
         bubble("you", ev.text);
         setState("thinking");
         break;
       case "reply_chunk":
-        if (!turn.agentBubble) turn.agentBubble = bubble("agent", ev.text);
-        else turn.agentBubble.textContent += " " + ev.text;
+        if (turn) turn.pendingText.push(ev.text);
         break;
       case "reply":
-        if (turn.agentBubble) turn.agentBubble.textContent = ev.text;
-        else if (ev.text) turn.agentBubble = bubble("agent", ev.text);
+        if (turn && ev.text) turn.fullReply = ev.text;
         break;
       case "audio_end":
         if (turn) turn.audioEnded = true;
@@ -353,9 +497,7 @@ async function start() {
   } catch (err) {
     if (cancelled()) return;
     userStopped = true; stopAudio(); setState("error");
-    notice(err && err.name === "NotAllowedError"
-      ? "Microphone access was blocked. Allow it in the address bar and press Start again."
-      : `Couldn't start the microphone (${err && err.message ? err.message : err}).`, "error");
+    notice(micErrorMessage(err), "error");
     return;
   }
   if (cancelled()) return;
@@ -380,6 +522,7 @@ function stop() {
 
 $("talk").addEventListener("click", () => (userStopped ? start() : stop()));
 try { $("code").value = localStorage.getItem("va_code") || ""; } catch (_) {}
+showMics();   // lists the mics before Start if permission was granted earlier
 setState("idle");
 
 fetch("/health", { cache: "no-store" }).then((r) => r.json()).then((h) => {

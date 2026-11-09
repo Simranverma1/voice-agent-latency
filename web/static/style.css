@@ -116,9 +116,12 @@ tr.win td { background: color-mix(in srgb, var(--accent) 9%, transparent); }
 @keyframes pulse { 50% { opacity: 0.35; } }
 .meter { height: 6px; background: var(--code-bg); border-radius: 3px; overflow: hidden; margin-top: 10px; }
 .meter > div { height: 100%; width: 0; background: var(--good); transition: width 60ms linear; }
+.mic-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.mic-row[hidden] { display: none; }
+.mic-row select { flex: 1; min-width: 0; font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
 .test-panel { border-style: dashed; border-color: var(--warn); }
 .test-panel select { font: inherit; padding: 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
-.notice { margin-top: 12px; padding: 10px 12px; border-radius: 10px; display: none; }
+.notice { margin-top: 12px; padding: 10px 12px; border-radius: 10px; display: none; overflow-wrap: anywhere; }
 .notice.info { display: block; background: var(--code-bg); }
 .notice.error { display: block; background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--text); }
 .log { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; }

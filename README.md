@@ -104,7 +104,9 @@ uvicorn web.server:app --port 8000
 ```
 
 Open http://127.0.0.1:8000/demo in Chrome, enter the access code, press
-**Start talking**, and allow the microphone. Headphones work best.
+**Start talking**, and allow the microphone. If the level bar doesn't move
+when you talk, pick another device in the **Microphone** list. Works through
+speakers; headphones give the cleanest audio.
 
 ### How it works
 
@@ -117,12 +119,28 @@ speaker ◄ gapless Web Audio playback  ◄─  sentence chunks → Deepgram Aur
                                            (requests pipelined, played in order)
 ```
 
-- **Same pipeline as the benchmark.** `web/session.py` reuses `agent/stt.py`,
-  `agent/llm.py`, `agent/tts.py`, `agent/metrics.py` and the `v5_full`
-  profile unchanged. Only the turn orchestration is re-implemented, because
-  `agent/pipeline.py` drives a local sound card and imports `sounddevice`,
-  which doesn't exist on a headless Linux server. Each orchestration step
-  points to the `pipeline.py` lines it mirrors.
+- **The benchmark's pipeline, plus three live fixes.** `web/session.py`
+  reuses `agent/stt.py`, `agent/llm.py`, `agent/tts.py`, `agent/metrics.py`
+  and the `v5_full` profile unchanged. Only the turn orchestration is
+  re-implemented, because `agent/pipeline.py` drives a local sound card and
+  imports `sounddevice`, which doesn't exist on a headless Linux server.
+  Each orchestration step points to the `pipeline.py` lines it mirrors.
+  Testing with a real person (not recordings) led to three deliberate
+  differences, each recorded in every live log line:
+  1. **Audio is forwarded as it is generated** instead of after each
+     sentence's audio has fully downloaded. Waiting made the voice trail
+     the on-screen text by up to 5 s; `7_audio_to_speaker` is now typically
+     under 0.4 s, and the rest is the speech service pausing mid-stream.
+  2. **700 ms end-of-speech silence** instead of 300 ms (`ENDPOINTING_MS`).
+     At 300 ms the agent answered people who had only paused. Costs ~0.4 s
+     per turn.
+  3. **An adaptive speech detector** (`web/vad.py`, `AdaptiveVAD`). The
+     benchmark's detector calibrates once; live, it calibrated while Chrome's
+     noise suppression was settling and then missed every turn of a
+     session. On the 20 recordings in simulation it now detects speech
+     20/20 in every tested condition, where the old one detected 6–14/20
+     in the hard ones.
+  These changes are not in the benchmark numbers above.
 - **Two live latency numbers per turn.** The server measures
   speech end → first reply audio *sent*; the browser measures speech end →
   reply audio *playing*. The difference is the internet hop plus browser
@@ -132,7 +150,12 @@ speaker ◄ gapless Web Audio playback  ◄─  sentence chunks → Deepgram Aur
   plays, so the agent can't hear and answer itself. There is no barge-in.
 - **Limits** (environment variables, defaults in brackets): `ACCESS_CODE`
   (required; the server refuses everyone without it), `MAX_SESSIONS` [2],
-  `MAX_TURNS` per session [20], `MAX_UTTERANCE_S` [15], `MAX_IDLE_S` [120].
+  `MAX_TURNS` per session [20], `MAX_UTTERANCE_S` [15], `MAX_IDLE_S` [120],
+  `ENDPOINTING_MS` [700].
+- **Microphone.** The page lists the microphones and remembers the choice.
+  If Windows refuses to open one ("Could not start audio source"), it tries
+  the others before giving up, and it warns when the chosen mic delivers no
+  sound at all.
 
 ### Tests
 

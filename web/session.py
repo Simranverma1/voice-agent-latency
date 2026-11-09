@@ -13,6 +13,16 @@ checked side by side. agent/ is not modified.
 What "playback_start" means here: the server cannot hear the browser's
 speaker, so it is the moment the first TTS audio frame was sent down the
 websocket. Live records carry a "measurement" field saying so.
+
+Three deliberate differences from v5_full, made after testing with a real
+person rather than recordings (each is recorded in every live log line):
+- Endpointing 700 ms instead of 300 ms (ENDPOINTING_MS). Replayed prompts
+  never pause mid-sentence; people do, and at 300 ms the agent cut them off.
+- Each TTS chunk's audio is forwarded as it arrives instead of after the
+  whole chunk has downloaded. Waiting cost 1-5 s of 7_audio_to_speaker live
+  and made the voice trail the on-screen text by seconds.
+- AdaptiveVAD instead of EnergyVAD (see web/vad.py): a once-only calibration
+  missed speech on every turn of a live session.
 """
 import asyncio
 import contextlib
@@ -29,14 +39,20 @@ from agent import tts as tts_mod
 from agent.config import MIC_BLOCK_BYTES, MIC_BLOCK_MS, MIC_SAMPLE_RATE, PROFILES
 from agent.metrics import LOG_DIR, Turn, now
 
-from .vad import EnergyVAD
+from .vad import AdaptiveVAD
 
 PROFILE = PROFILES["v5_full"]
 LOG_FILE = LOG_DIR / "live_web.jsonl"
 MEASUREMENT = (
     "web_server: playback_start = first audio frame sent, playback_done = last "
-    "audio frame sent; excludes browser network and playback"
+    "audio frame sent; excludes browser network and playback. v5_full except "
+    "endpointing (meta.endpointing_ms), TTS audio streamed within each chunk, "
+    "and AdaptiveVAD"
 )
+
+# Bytes to hold back at the start of each TTS response until any WAV header
+# (Deepgram sends one with linear16) can be recognised and stripped.
+WAV_HEADER_MAX = 1024
 
 # 100 ms of 24 kHz int16 per websocket frame: small enough that the browser
 # can start playing early, large enough to keep per-message overhead low.
@@ -67,6 +83,9 @@ def _env_int(name: str, default: int) -> int:
 MAX_TURNS = _env_int("MAX_TURNS", 20)            # per connection
 MAX_UTTERANCE_S = _env_int("MAX_UTTERANCE_S", 15)
 MAX_IDLE_S = _env_int("MAX_IDLE_S", 120)         # frees the slot of a forgotten tab
+# Silence Deepgram waits for before calling the turn over. Lower answers
+# sooner but interrupts people who pause mid-sentence.
+ENDPOINTING_MS = _env_int("ENDPOINTING_MS", 700)
 
 
 class _Disconnected(Exception):
@@ -114,25 +133,48 @@ def _strip_wav_header(audio: bytes) -> bytes:
     return audio[i + 8:] if i >= 0 else audio
 
 
+def _header_resolved(head: bytes) -> bool:
+    """True once enough of a response has arrived to strip its header."""
+    if len(head) < 4:
+        return False
+    if head[:4] != b"RIFF" or len(head) >= WAV_HEADER_MAX:
+        return True
+    i = head.find(b"data", 12)
+    return i >= 0 and len(head) >= i + 8
+
+
 class _AudioOut:
     """Stands in for agent.audio_io.Player: same feed() role, but the
-    "speaker" is the websocket."""
+    "speaker" is the websocket. Sends whole 100 ms frames; flush() sends the
+    remainder at the end of each TTS chunk."""
 
     def __init__(self, send_bytes: Callable[[bytes], Awaitable[None]]):
         self._send = send_bytes
-        self._carry = b""
+        self._buf = b""
         self.first_send_ts: float | None = None
 
+    async def _send_frame(self, frame: bytes):
+        await self._send(frame)
+        if self.first_send_ts is None:
+            self.first_send_ts = now()
+
     async def feed(self, pcm: bytes):
-        # int16 samples are 2 bytes; never split one across frames (same
-        # odd-byte rule as Player, audio_io.py:~301).
-        data = self._carry + pcm
-        cut = len(data) - (len(data) % 2)
-        data, self._carry = data[:cut], data[cut:]
-        for i in range(0, len(data), AUDIO_FRAME_BYTES):
-            await self._send(data[i:i + AUDIO_FRAME_BYTES])
-            if self.first_send_ts is None:
-                self.first_send_ts = now()
+        # Frames are an even number of bytes, so an int16 sample is never
+        # split across them however the network chops up the TTS stream
+        # (same odd-byte rule as Player, audio_io.py:~301).
+        self._buf += pcm
+        while len(self._buf) >= AUDIO_FRAME_BYTES:
+            frame, self._buf = self._buf[:AUDIO_FRAME_BYTES], self._buf[AUDIO_FRAME_BYTES:]
+            await self._send_frame(frame)
+
+    async def flush(self):
+        # A trailing odd byte would be half a sample; the next chunk is a
+        # separate TTS response, so carrying it over would shift every one of
+        # its samples by a byte. Drop it.
+        n = len(self._buf) - len(self._buf) % 2
+        if n:
+            await self._send_frame(self._buf[:n])
+        self._buf = b""
 
 
 class Session:
@@ -150,7 +192,7 @@ class Session:
         # One VAD per connection, not per turn: if it recalibrated each turn,
         # a user who starts talking right after a reply would calibrate it on
         # their own voice and it would never detect speech.
-        self.vad = EnergyVAD()
+        self.vad = AdaptiveVAD()
         self.audio_in: asyncio.Queue = asyncio.Queue()
         self._partial = b""
         self.listening = False
@@ -219,7 +261,7 @@ class Session:
         # assign self.dg after connect() succeeds, so a failed handshake
         # leaves it None and the next turn retries.
         if self.dg is None:
-            dg = _DeepgramStream(endpointing_ms=self.p.silence_ms)
+            dg = _DeepgramStream(endpointing_ms=ENDPOINTING_MS)
             await dg.connect()
             self.dg = dg
 
@@ -241,6 +283,13 @@ class Session:
         last_speech_ts = None
         first_speech_ts = None
         idle_deadline = now() + MAX_IDLE_S
+        # Bytes received in this listen, and the count at the end of the last
+        # speech block. The browser counts the bytes it sends from the same
+        # "listening" event, so it can look up when *it* sent that byte and
+        # time its own e2e from the server's speech-end decision.
+        received = 0
+        self.speech_end_byte: int | None = None
+        self.vad.reset_peak()
         # Open the gate before announcing it, so a client that starts
         # streaming the instant it sees "listening" loses no audio.
         self.listening = True
@@ -260,6 +309,7 @@ class Session:
                     raise _Disconnected
                 ts, block = item
                 pcm.extend(block)
+                received += len(block)
                 await self.dg.send(block)
                 self._last_dg_audio = ts
 
@@ -267,6 +317,7 @@ class Session:
                     speech_started = True
                     silent_blocks = 0
                     last_speech_ts = ts
+                    self.speech_end_byte = received
                     first_speech_ts = first_speech_ts or ts
                     turn.mark("speech_started", ts)
                 elif speech_started:
@@ -306,6 +357,9 @@ class Session:
         finally:
             self.listening = False
 
+        # Logged so a missed or late detection can be diagnosed afterwards.
+        turn.set(endpointing_ms=ENDPOINTING_MS, vad_threshold=round(self.vad.threshold),
+                 vad_peak_rms=round(self.vad.peak))
         if last_speech_ts is None:
             # Deepgram heard words the local VAD did not; there is no
             # trustworthy speech_end_true, so flag the turn.
@@ -364,24 +418,39 @@ class Session:
             finally:
                 await text_q.put(None)
 
-        async def fetch_chunk_audio(chunk: str) -> bytes:
+        async def fetch_chunk_audio(chunk: str, audio_q: asyncio.Queue):
+            # Puts this chunk's audio on audio_q piece by piece as it arrives,
+            # then None. A failure is put on the queue too, so the feeder
+            # raises it in order instead of mistaking it for the end.
             turn.mark("tts_request_sent")
-            audio = bytearray()
-            async for b in synth(chunk, self.client, self.p.tts_model):
-                turn.mark("tts_first_audio")
-                audio.extend(b)
-            if audio[:4] == b"RIFF":
-                turn.set(tts_wav_header=True)
-            return _strip_wav_header(bytes(audio))
+            head = b""   # held until any WAV header can be stripped
+            try:
+                async for b in synth(chunk, self.client, self.p.tts_model):
+                    turn.mark("tts_first_audio")
+                    if head is not None:
+                        head += b
+                        if not _header_resolved(head):
+                            continue
+                        if head[:4] == b"RIFF":
+                            turn.set(tts_wav_header=True)
+                        b, head = _strip_wav_header(head), None
+                    await audio_q.put(b)
+                if head:
+                    await audio_q.put(_strip_wav_header(head))
+                await audio_q.put(None)
+            except Exception as e:  # noqa: BLE001
+                await audio_q.put(e)
 
         fetches: list[asyncio.Task] = []
 
         async def consumer():
             # Pipelined TTS, mirrors pipeline.py:218-248: the dispatcher
-            # starts a TTS task per chunk the moment its text is ready
-            # (pipeline.py:239); the feeder awaits those tasks strictly in
-            # chunk order (pipeline.py:241-246), so playback order is kept
-            # even when a later chunk's audio lands first.
+            # starts a TTS request per chunk the moment its text is ready
+            # (pipeline.py:239); the feeder plays them strictly in chunk order
+            # (pipeline.py:241-246), so order is kept even when a later
+            # chunk's audio lands first. Unlike pipeline.py, the feeder
+            # forwards each chunk's audio as it streams in rather than
+            # waiting for all of it (see module docstring).
             fetch_q: asyncio.Queue = asyncio.Queue()
 
             async def dispatcher():
@@ -390,17 +459,25 @@ class Session:
                     if chunk is None:
                         await fetch_q.put(None)
                         break
-                    task = asyncio.create_task(fetch_chunk_audio(chunk))
-                    fetches.append(task)
-                    await fetch_q.put(task)
-                    await self.send_json({"type": "reply_chunk", "text": chunk})
+                    audio_q: asyncio.Queue = asyncio.Queue()
+                    fetches.append(asyncio.create_task(fetch_chunk_audio(chunk, audio_q)))
+                    await fetch_q.put((chunk, audio_q))
 
             async def feeder():
                 while True:
-                    task = await fetch_q.get()
-                    if task is None:
+                    item = await fetch_q.get()
+                    if item is None:
                         break
-                    await out.feed(await task)
+                    chunk, audio_q = item
+                    # The text goes out just before its own audio, so the
+                    # browser can show each sentence as it is spoken rather
+                    # than seconds ahead of the voice.
+                    await self.send_json({"type": "reply_chunk", "text": chunk})
+                    while (b := await audio_q.get()) is not None:
+                        if isinstance(b, Exception):
+                            raise b
+                        await out.feed(b)
+                    await out.flush()
 
             await asyncio.gather(dispatcher(), feeder())
 
@@ -439,7 +516,8 @@ class Session:
                 self.dg = None
                 return turn
             turn.set(user_text=user_text, audio_ms=round(len(pcm) / 2 / MIC_SAMPLE_RATE * 1000))
-            await self.send_json({"type": "transcript", "text": user_text})
+            await self.send_json({"type": "transcript", "text": user_text,
+                                  "speech_end_byte": self.speech_end_byte})
 
             reply = await self._respond(user_text, turn)
             turn.set(reply=reply, reply_chars=len(reply))

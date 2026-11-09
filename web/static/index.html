@@ -140,8 +140,8 @@
       <div>
         <p><span class="badge live">LIVE</span></p>
         <p class="small">
-          The live demo runs the final version (v5) on a server, and shows two numbers for every
-          turn: the <strong>server's</strong> time (your speech end arriving → first reply audio sent) and the
+          The live demo runs the final version (v5) on a server, with three changes found by testing
+          with real people (below), and shows two numbers for every turn: the <strong>server's</strong> time (your speech end arriving → first reply audio sent) and the
           <strong>browser's</strong> time (you stop talking → reply audio starts playing). The gap between them
           is the internet trip to the server plus audio buffering. Live numbers depend on your
           connection and are not directly comparable with the benchmark.
@@ -159,6 +159,9 @@
       <div class="card"><h3>Requests that never time out</h3><p class="small">A connection that trickles data never trips a per-read timeout. Fix: an overall 20-second deadline per streamed response, plus one retry on temporary network errors.</p></div>
       <div class="card"><h3>A speech detector that never heard speech</h3><p class="small">The detector learns the room's noise level from the first half-second. The recordings started mid-word, so it learned "speech = background" and waited forever. Fix: feed it 600 ms of silence first.</p></div>
       <div class="card"><h3>The agent hearing itself</h3><p class="small">In the browser, the microphone can pick up the agent's own voice and answer it. Fix: the page stops sending microphone audio until the reply has finished playing.</p></div>
+      <div class="card"><h3>The voice trailing the text by seconds</h3><p class="small">Live, the server waited for a whole sentence's audio before sending any of it: up to 5 seconds on a long sentence, while the text was already on screen. Fix (live demo only): forward the audio as it is generated, and show each sentence's text when its voice starts. Waiting dropped to typically under 0.4 s.</p></div>
+      <div class="card"><h3>Interrupting people mid-sentence</h3><p class="small">Recorded questions never pause; real people do. At 300 ms of silence the agent answered half-finished sentences. Fix (live demo only): wait 700 ms. The cost is about 0.4 s on every turn, a deliberate trade.</p></div>
+      <div class="card"><h3>A live speech detector that went deaf</h3><p class="small">The detector learned the room's noise level once, in the first half-second, while the browser's noise suppression was still settling, then missed every word for the whole session. Fix: keep tracking the noise level. In simulation it found the speech in all 20 recordings, under noise and at low volume, where the old one found it in as few as 6.</p></div>
       <div class="card"><h3>"When did you stop talking?" is a judgement call</h3><p class="small">Two reasonable loudness thresholds disagreed by 0.3–2.1 seconds on quiet recordings. That uncertainty sits inside every latency number, including the benchmark's.</p></div>
     </div>
   </section>
@@ -170,7 +173,9 @@
       <li>All benchmark turns came from one location in one session; network quality varies by time of day.</li>
       <li>The recordings are clean: no background noise, accents or crosstalk.</li>
       <li>Speech synthesis started noticeably slower in the streaming versions (~940–1000 ms vs ~340–480 ms). The cause is not yet isolated.</li>
-      <li>The biggest remaining live delay is waiting for each phrase's full audio before sending it. Streaming within a phrase is the obvious next step.</li>
+      <li>The live demo is not identical to benchmarked v5: it streams audio within each sentence, waits 700 ms instead of 300 ms for end of speech, and uses an adaptive speech detector. Those changes have not been benchmarked on the 20 recordings.</li>
+      <li>There is no barge-in: you can't interrupt the agent while it speaks.</li>
+      <li>The speech service sometimes clips the last syllable of a reply; measured, it arrives already cut.</li>
     </ul>
   </section>
 
