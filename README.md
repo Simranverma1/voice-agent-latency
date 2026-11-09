@@ -87,7 +87,9 @@ python demo.py --profile v1_baseline
 
 ## Web demo
 
-**Live:** _link coming soon_ (access code required; ask the author).
+**Live:** https://voice-agent-demo-9de4.onrender.com (access code required;
+ask the author). Free hosting: after 15 minutes without visitors the server
+sleeps, and the first visit takes about a minute to wake it.
 
 A browser version of the optimized `v5_full` pipeline: press a button, talk,
 and hear the reply, with a live latency breakdown for every turn. The landing
